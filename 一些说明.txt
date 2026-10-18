@@ -1,0 +1,47 @@
+我目前已完成的工作：
+
+1. 数据库设计与实现
+
+完成了 ER 图设计（6 张表：Users, Events, Venues, Categories, Registrations, Event_Categories）。
+
+在 MySQL Workbench 中建库建表，实现了外键约束、UNIQUE(student_id, event_id) 防重复报名约束。
+
+导出了 database/schema.sql 数据库建表脚本。
+
+2. 后端开发（Python + Flask）
+
+实现了完整的 RESTful API 接口，包括：
+
+用户注册 / 登录（采用 bcrypt 密码加密存储）
+
+获取活动列表
+
+学生报名活动（含名额校验、时间校验、防重复报名）
+
+取消报名 / 重新报名（状态流转：registered → cancelled → registered）
+
+组织者发布活动（含角色权限校验）
+
+查询个人报名记录（三表 JOIN 查询）
+
+所有接口均通过 Postman 测试，返回统一的 JSON 格式。
+
+3. 前端开发（HTML + CSS + JavaScript）
+
+完成了三个页面：登录/注册页（login.html）、活动大厅（index.html）、个人中心（profile.html）。
+
+使用 Fetch API 调用后端接口，实现了完整的前后端数据交互。
+
+采用现代渐变风格 CSS 设计，界面简洁美观。
+
+实现了前端状态判断（活动已结束时按钮自动置灰）。
+
+4. 测试与文档
+
+完成了全流程测试：注册 → 登录 → 报名 → 查看记录 → 取消报名 → 重新报名 → 组织者发布活动。
+
+编写了 README.md 项目说明文档。
+测试账号：
+学生：1826777959@qq.com  password:1123587
+组织者：organizer@test.com password：123456
+组织者和学生账号均可注册 

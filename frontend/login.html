@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>校园活动系统 - 登录</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            background: #ededed;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .login-container {
+            background: #fff;
+            width: 400px;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+            padding: 40px 35px;
+        }
+        .logo {
+            width: 64px;
+            height: 64px;
+            background: #07c160;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            margin: 0 auto 20px;
+        }
+        h2 {
+            text-align: center;
+            color: #191919;
+            margin-bottom: 30px;
+            font-size: 22px;
+            font-weight: 500;
+        }
+        .form-group { margin-bottom: 18px; }
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            color: #888;
+            font-size: 13px;
+        }
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 12px 14px;
+            background: #f7f7f7;
+            border: 1px solid #e5e5e5;
+            border-radius: 8px;
+            color: #191919;
+            font-size: 15px;
+            outline: none;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+        .form-group input:focus,
+        .form-group select:focus {
+            border-color: #07c160;
+            background: #fff;
+        }
+        .btn {
+            width: 100%;
+            padding: 13px;
+            background: #07c160;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-top: 10px;
+        }
+        .btn:hover { background: #06ad56; }
+        .btn:active { background: #059d4e; }
+        .toggle-link {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 14px;
+            color: #576b95;
+            cursor: pointer;
+        }
+        .toggle-link:hover { text-decoration: underline; }
+        .hidden { display: none; }
+        .toast {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) scale(0.9);
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 14px 24px;
+            border-radius: 8px;
+            font-size: 15px;
+            opacity: 0;
+            pointer-events: none;
+            transition: all 0.3s;
+            z-index: 9999;
+        }
+        .toast.show {
+            opacity: 1;
+            transform: translate(-50%, -50%) scale(1);
+        }
+    </style>
+</head>
+<body>
+
+<!-- 统一为所有 API 请求附带登录令牌；令牌失效自动跳回登录页（修改版新增） -->
+<script>
+    (function () {
+        const _fetch = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+            init = init || {};
+            const token = localStorage.getItem('token');
+            if (token) {
+                init.headers = Object.assign({}, init.headers, { 'Authorization': 'Bearer ' + token });
+            }
+            return _fetch(input, init).then(function (res) {
+                if (res.status === 401 && location.pathname.indexOf('login') === -1) {
+                    localStorage.removeItem('token');
+                    localStorage.removeItem('user');
+                    window.location.href = 'login.html';
+                }
+                return res;
+            });
+        };
+    })();
+</script>
+
+<div class="login-container">
+    <div id="login-form">
+        <div class="logo">🎓</div>
+        <h2>登录校园活动系统</h2>
+        <div class="form-group">
+            <label>邮箱</label>
+            <input type="email" id="login-email" placeholder="请输入邮箱">
+        </div>
+        <div class="form-group">
+            <label>密码</label>
+            <input type="password" id="login-password" placeholder="请输入密码">
+        </div>
+        <button class="btn" onclick="handleLogin()">登 录</button>
+        <div class="toggle-link" onclick="toggleForm('register')">还没有账号？立即注册</div>
+    </div>
+
+    <div id="register-form" style="display:none;">
+        <div class="logo">✨</div>
+        <h2>创建新账号</h2>
+        <div class="form-group">
+            <label>姓名</label>
+            <input type="text" id="reg-name" placeholder="请输入姓名">
+        </div>
+        <div class="form-group">
+            <label>邮箱</label>
+            <input type="email" id="reg-email" placeholder="请输入邮箱">
+        </div>
+        <div class="form-group">
+            <label>密码</label>
+            <input type="password" id="reg-password" placeholder="请输入密码" oninput="checkPasswordStrength()">
+            <div id="password-strength" style="margin-top:6px; font-size:12px; display:none;">
+                <div style="height:4px; background:#eee; border-radius:2px; overflow:hidden; margin-bottom:4px;">
+                    <div id="strength-bar" style="height:100%; width:0%; transition:all 0.3s;"></div>
+                </div>
+                <span id="strength-text"></span>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>注册身份</label>
+            <select id="reg-role">
+                <option value="student">学生（报名活动）</option>
+                <option value="organizer">组织者（发布活动）</option>
+            </select>
+        </div>
+        <button class="btn" onclick="handleRegister()">注 册</button>
+        <div class="toggle-link" onclick="toggleForm('login')">已有账号？返回登录</div>
+    </div>
+</div>
+
+<!-- ⚠️ Toast 提示组件 -->
+<div id="toast" class="toast">
+    <span id="toast-text"></span>
+</div>
+
+<script>
+    // ============ Toast 提示 ============
+    function showToast(message, duration = 1500) {
+        const toast = document.getElementById('toast');
+        const text = document.getElementById('toast-text');
+        text.textContent = message;
+        toast.classList.add('show');
+        setTimeout(() => {
+            toast.classList.remove('show');
+        }, duration);
+    }
+
+    // ============ 表单切换 ============
+    function toggleForm(formType) {
+        const loginForm = document.getElementById('login-form');
+        const registerForm = document.getElementById('register-form');
+        if (formType === 'register') {
+            loginForm.style.display = 'none';
+            registerForm.style.display = 'block';
+        } else {
+            registerForm.style.display = 'none';
+            loginForm.style.display = 'block';
+        }
+    }
+
+    // ============ 密码强度检测 ============
+    function checkPasswordStrength() {
+        const password = document.getElementById('reg-password').value;
+        const strengthDiv = document.getElementById('password-strength');
+        const bar = document.getElementById('strength-bar');
+        const text = document.getElementById('strength-text');
+
+        if (password.length === 0) {
+            strengthDiv.style.display = 'none';
+            return;
+        }
+
+        strengthDiv.style.display = 'block';
+        let score = 0;
+        if (password.length >= 8) score++;
+        if (/[A-Z]/.test(password)) score++;
+        if (/[a-z]/.test(password)) score++;
+        if (/[0-9]/.test(password)) score++;
+        if (/[^A-Za-z0-9]/.test(password)) score++;
+
+        let color, width, tip;
+        if (score <= 2) {
+            color = '#fa5151'; width = '30%';
+            tip = '强度：弱 · 至少 8 位，含大小写字母和数字';
+        } else if (score <= 4) {
+            color = '#ffc300'; width = '65%';
+            tip = '强度：中 · 还可以，加入特殊符号会更强';
+        } else {
+            color = '#07c160'; width = '100%';
+            tip = '强度：强 · 密码很安全';
+        }
+
+        bar.style.width = width;
+        bar.style.background = color;
+        text.textContent = tip;
+        text.style.color = color;
+    }
+
+    // ============ 注册 ============
+    async function handleRegister() {
+        const name = document.getElementById('reg-name').value;
+        const email = document.getElementById('reg-email').value;
+        const password = document.getElementById('reg-password').value;
+        const role = document.getElementById('reg-role').value;
+
+        if (!name || !email || !password) { showToast('⚠ 请填写所有注册信息'); return; }
+        if (password.length < 8) { showToast('⚠ 密码长度不能少于 8 位'); return; }
+        if (!/[A-Z]/.test(password)) { showToast('⚠ 密码必须包含至少一个大写字母'); return; }
+        if (!/[a-z]/.test(password)) { showToast('⚠ 密码必须包含至少一个小写字母'); return; }
+        if (!/[0-9]/.test(password)) { showToast('⚠ 密码必须包含至少一个数字'); return; }
+
+        try {
+            const response = await fetch('/api/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, email, password, role })
+            });
+            const data = await response.json();
+            if (data.code === 200) {
+                showToast('✓ 注册成功，请登录');
+                setTimeout(() => {
+                    toggleForm('login');
+                }, 1000);
+            } else {
+                showToast('✗ ' + data.message);
+            }
+        } catch (error) {
+            showToast('⚠ 网络错误，请确认后端服务已启动');
+        }
+    }
+
+    // ============ 登录 ============
+    async function handleLogin() {
+        const email = document.getElementById('login-email').value;
+        const password = document.getElementById('login-password').value;
+
+        if (!email || !password) { showToast('⚠ 请输入邮箱和密码'); return; }
+
+        try {
+            const response = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password })
+            });
+            const data = await response.json();
+            if (data.code === 200) {
+                localStorage.setItem('user', JSON.stringify(data.data));
+                localStorage.setItem('token', data.token);
+                showToast('✓ 登录成功，正在跳转...');
+                setTimeout(() => {
+                    window.location.href = 'index.html';
+                }, 1000);
+            } else {
+                showToast('✗ ' + data.message);
+            }
+        } catch (error) {
+            showToast('⚠ 网络错误，请确认后端服务已启动');
+        }
+    }
+
+    // ============ 页面加载时：显示登录表单 ============
+    document.addEventListener('DOMContentLoaded', function() {
+        document.getElementById('login-form').style.display = 'block';
+        document.getElementById('register-form').style.display = 'none';
+    });
+</script>
+</body>
+</html>
