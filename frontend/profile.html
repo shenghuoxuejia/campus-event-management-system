@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>我的报名</title>
+    <link rel="icon" href="data:,">
     <style>
         * {
             margin: 0;
@@ -124,6 +125,73 @@
             color: white;
         }
 
+        .toast {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) scale(0.9);
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 14px 24px;
+            border-radius: 8px;
+            font-size: 15px;
+            opacity: 0;
+            pointer-events: none;
+            transition: all 0.3s;
+            z-index: 9999;
+        }
+        .toast.show {
+            opacity: 1;
+            transform: translate(-50%, -50%) scale(1);
+        }
+
+        .confirm-modal {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+        }
+        .confirm-box {
+            background: white;
+            border-radius: 12px;
+            width: 320px;
+            padding: 25px 20px 20px;
+            text-align: center;
+            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+        }
+        .confirm-title {
+            font-size: 16px;
+            font-weight: 500;
+            color: #191919;
+            margin-bottom: 12px;
+        }
+        .confirm-message {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 22px;
+            line-height: 1.6;
+        }
+        .confirm-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        .confirm-btn {
+            flex: 1;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+        }
+        .confirm-btn.cancel { background: #f7f7f7; color: #666; }
+        .confirm-btn.cancel:hover { background: #eee; }
+        .confirm-btn.ok { background: #07c160; color: white; }
+        .confirm-btn.ok:hover { background: #06ad56; }
+
         .empty-msg {
             text-align: center;
             color: #999;
@@ -135,7 +203,7 @@
 
 <body>
 
-<!-- 统一为所有 API 请求附带登录令牌；令牌失效自动跳回登录页（修改版新增） -->
+<!-- 统一为所有 API 请求附带登录令牌；令牌失效自动跳回登录页 -->
 <script>
     (function () {
         const _fetch = window.fetch.bind(window);
@@ -146,7 +214,7 @@
                 init.headers = Object.assign({}, init.headers, { 'Authorization': 'Bearer ' + token });
             }
             return _fetch(input, init).then(function (res) {
-                if (res.status === 401 && location.pathname.indexOf('login') === -1) {
+                if (res.status === 401 && location.pathname !== '/' && location.pathname.indexOf('login') === -1) {
                     localStorage.removeItem('token');
                     localStorage.removeItem('user');
                     window.location.href = 'login.html';
@@ -156,6 +224,19 @@
         };
     })();
 </script>
+
+    <div id="toast" class="toast"><span id="toast-text"></span></div>
+
+    <div id="confirm-modal" class="confirm-modal" style="display:none;">
+        <div class="confirm-box">
+            <div class="confirm-title">提示</div>
+            <div class="confirm-message" id="confirm-message">确定要执行此操作吗？</div>
+            <div class="confirm-buttons">
+                <button class="confirm-btn cancel" onclick="closeConfirm(false)">取消</button>
+                <button class="confirm-btn ok" onclick="closeConfirm(true)">确定</button>
+            </div>
+        </div>
+    </div>
 
     <div class="header">
         <h1>📋 我的报名</h1>
@@ -169,15 +250,64 @@
 
     <script>
         const userStr = localStorage.getItem('user');
-        if (!userStr) { alert('请先登录！'); window.location.href = 'login.html'; }
-        const currentUser = JSON.parse(userStr);
+        if (!userStr) {
+            location.replace('login.html');
+            throw new Error('未登录，已跳转');
+        }
+        let currentUser;
+        try {
+            currentUser = JSON.parse(userStr);
+        } catch (e) {
+            localStorage.removeItem('user');
+            localStorage.removeItem('token');
+            location.replace('login.html');
+            throw e;
+        }
+
+        // HTML 转义（防 XSS）
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
 
         function logout() {
             localStorage.removeItem('user');
             localStorage.removeItem('token');
             window.location.href = 'login.html';
         }
-        // ============ 时间格式化工具 ============
+
+        // Toast 提示
+        function showToast(message, duration = 1800) {
+            const toast = document.getElementById('toast');
+            document.getElementById('toast-text').textContent = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), duration);
+        }
+
+        // 自定义确认弹窗
+        let confirmResolve = null;
+
+        function showConfirm(message) {
+            return new Promise((resolve) => {
+                document.getElementById('confirm-message').textContent = message;
+                document.getElementById('confirm-modal').style.display = 'flex';
+                confirmResolve = resolve;
+            });
+        }
+
+        function closeConfirm(result) {
+            document.getElementById('confirm-modal').style.display = 'none';
+            if (confirmResolve) {
+                confirmResolve(result);
+                confirmResolve = null;
+            }
+        }
+        // 时间格式化工具
         function formatDateTime(dateStr) {
             if (!dateStr) return '';
             const str = String(dateStr).replace('T', ' ');
@@ -196,12 +326,16 @@
         }
 
 
-        async function loadMyRegistrations() {
+        let myRegPage = 1;
+        let myRegPages = 0;
+
+        async function loadMyRegistrations(reset = true) {
+            if (reset) myRegPage = 1;
             try {
-                const response = await fetch(`/api/user_registrations/${currentUser.user_id}`);
+                const response = await fetch(`/api/user_registrations/${currentUser.user_id}?page=${myRegPage}&page_size=20`);
                 const result = await response.json();
                 const listDiv = document.getElementById('registration-list');
-                listDiv.innerHTML = '';
+                if (reset) listDiv.innerHTML = '';
 
                 if (result.code === 200 && result.data.length > 0) {
                     result.data.forEach(reg => {
@@ -217,13 +351,17 @@
                             ? `<button class="btn-cancel" onclick="cancelRegistration(${reg.registration_id})">取消报名</button>`
                             : '';
 
+                        const checkinLine = reg.check_in_time
+                            ? `<p>✅ 签到时间：${formatDateTime(reg.check_in_time)}</p>`
+                            : '';
+
                         card.innerHTML = `
                         <div class="reg-info">
-                            <h3>${reg.event_title}</h3>
-                            <p>📍 地点：${reg.venue_name}（${reg.location}）</p>
-                            <p>📍 地点：${reg.venue_name}（${reg.location}）</p>
+                            <h3>${escapeHtml(reg.event_title)}</h3>
+                            <p>📍 地点：${escapeHtml(reg.venue_name)}（${escapeHtml(reg.location)}）</p>
                             <p>📅 活动时间：${formatDateTime(reg.start_time)}</p>
                             <p>📝 报名时间：${formatDateTime(reg.registered_at)}</p>
+                            ${checkinLine}
                         </div>
                         <div style="text-align: right;">
                             <span class="status-badge ${statusClass}">${statusText}</span>
@@ -233,23 +371,46 @@
                     `;
                         listDiv.appendChild(card);
                     });
-                } else {
+                } else if (reset) {
                     listDiv.innerHTML = '<p class="empty-msg">你还没有报名任何活动</p>';
                 }
+
+                
+                myRegPages = result.pages || 0;
+                let more = document.getElementById('my-reg-more');
+                if (!more) {
+                    more = document.createElement('button');
+                    more.id = 'my-reg-more';
+                    more.className = 'btn-cancel';
+                    more.style.cssText = 'display:block; margin:20px auto; padding:10px 30px;';
+                    more.textContent = '加载更多';
+                    more.onclick = () => { myRegPage += 1; loadMyRegistrations(false); };
+                    listDiv.parentElement.appendChild(more);
+                }
+                more.style.display = myRegPage < myRegPages ? 'block' : 'none';
             } catch (error) {
                 console.error(error);
-                document.getElementById('registration-list').innerHTML = '<p style="color:#fa5151; text-align:center;">无法连接后端，请确认后端已启动。</p>';
+                if (reset) {
+                    document.getElementById('registration-list').innerHTML = '<p style="color:#fa5151; text-align:center;">无法连接后端，请确认后端已启动。</p>';
+                }
             }
         }
 
         async function cancelRegistration(registrationId) {
-            if (!confirm('确定要取消报名吗？取消后名额将释放。')) return;
+            const ok = await showConfirm('确定要取消报名吗？取消后名额将释放。');
+            if (!ok) return;
             try {
                 const response = await fetch(`/api/cancel_registration/${registrationId}`, { method: 'PUT' });
                 const data = await response.json();
-                if (data.code === 200) { alert('取消报名成功！'); loadMyRegistrations(); }
-                else { alert('取消失败: ' + data.message); }
-            } catch (error) { alert('网络错误，请检查后端。'); }
+                if (data.code === 200) {
+                    showToast('✓ ' + data.message);
+                    loadMyRegistrations();
+                } else {
+                    showToast('✗ ' + data.message);
+                }
+            } catch (error) {
+                showToast('⚠ 网络错误，请检查后端');
+            }
         }
 
         loadMyRegistrations();
