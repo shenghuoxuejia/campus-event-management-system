@@ -6,6 +6,12 @@ __pycache__/
 venv/
 env/
 
+# ---- 测试与覆盖率 ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
 # ---- 环境变量与密钥：绝对不要提交 ----
 .env
 .env.local
@@ -13,6 +19,7 @@ env/
 
 # ---- 日志与系统文件 ----
 *.log
+logs/
 .DS_Store
 Thumbs.db
 
@@ -23,3 +30,13 @@ Thumbs.db
 # ---- 临时文件 ----
 *.tmp
 ~$*
+*.bak
+backup*.sql
+*_dump.sql
+*.zip
+
+# ---- 课程/个人材料：不随代码发布 ----
+作业要求/
+作业*清单*.txt
+已修改问题清单*.txt
+课程大作业问题清单.txt

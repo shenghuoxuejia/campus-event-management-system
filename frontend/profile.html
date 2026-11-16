@@ -248,6 +248,19 @@
 
     <div class="container" id="registration-list"></div>
 
+    <!-- 修改密码 -->
+    <div class="container" style="margin-top:20px;">
+        <h3 style="margin-bottom:12px; font-size:15px;">🔑 修改密码</h3>
+        <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+            <input type="password" id="old-password" placeholder="旧密码" autocomplete="current-password"
+                   style="flex:1; min-width:160px; padding:10px; border:1px solid #e5e5e5; border-radius:8px;">
+            <input type="password" id="new-password" placeholder="新密码（≥8 位，含大小写与数字）" autocomplete="new-password"
+                   style="flex:1; min-width:200px; padding:10px; border:1px solid #e5e5e5; border-radius:8px;">
+            <button class="btn-cancel" style="width:auto; padding:10px 22px;" onclick="changePassword(this)">确认修改</button>
+        </div>
+        <p style="color:#999; font-size:12px; margin-top:8px;">修改成功后需要重新登录（旧登录令牌会全部失效）。</p>
+    </div>
+
     <script>
         const userStr = localStorage.getItem('user');
         if (!userStr) {
@@ -276,9 +289,11 @@
         }
 
         function logout() {
-            localStorage.removeItem('user');
-            localStorage.removeItem('token');
-            window.location.href = 'login.html';
+            fetch('/api/logout', { method: 'POST' }).catch(() => {}).finally(() => {
+                localStorage.removeItem('user');
+                localStorage.removeItem('token');
+                window.location.href = 'login.html';
+            });
         }
 
         // Toast 提示
@@ -330,14 +345,23 @@
         let myRegPages = 0;
 
         async function loadMyRegistrations(reset = true) {
-            if (reset) myRegPage = 1;
+            const targetPage = reset ? 1 : myRegPage + 1;
             try {
-                const response = await fetch(`/api/user_registrations/${currentUser.user_id}?page=${myRegPage}&page_size=20`);
+                const response = await fetch(`/api/user_registrations/${currentUser.user_id}?page=${targetPage}&page_size=20`);
                 const result = await response.json();
                 const listDiv = document.getElementById('registration-list');
-                if (reset) listDiv.innerHTML = '';
 
-                if (result.code === 200 && result.data.length > 0) {
+                // 先把错误显示清楚：不能把 401/500 也说成「你还没有报名」
+                if (result.code !== 200) {
+                    if (reset) {
+                        listDiv.innerHTML = `<p style="color:#fa5151; text-align:center;">${escapeHtml(result.message || '加载失败')}</p>`;
+                    }
+                    return;
+                }
+                if (reset) listDiv.innerHTML = '';
+                myRegPage = targetPage;
+
+                if (result.data.length > 0) {
                     result.data.forEach(reg => {
                         const card = document.createElement('div');
                         card.className = 'reg-card';
@@ -347,8 +371,10 @@
                         if (reg.registration_status === 'checked_in') { statusText = '已签到'; statusClass = 'status-checked_in'; }
                         else if (reg.registration_status === 'cancelled') { statusText = '已取消'; statusClass = 'status-cancelled'; }
 
-                        const cancelBtn = reg.registration_status === 'registered'
-                            ? `<button class="btn-cancel" onclick="cancelRegistration(${reg.registration_id})">取消报名</button>`
+                        // 后台不允许活动开始后取消，前端也不再展示无用按钮
+                        const started = reg.start_time && new Date(String(reg.start_time).replace(' ', 'T')) <= new Date();
+                        const cancelBtn = (reg.registration_status === 'registered' && !started)
+                            ? `<button class="btn-cancel" onclick="cancelRegistration(${reg.registration_id}, this)">取消报名</button>`
                             : '';
 
                         const checkinLine = reg.check_in_time
@@ -375,7 +401,6 @@
                     listDiv.innerHTML = '<p class="empty-msg">你还没有报名任何活动</p>';
                 }
 
-                
                 myRegPages = result.pages || 0;
                 let more = document.getElementById('my-reg-more');
                 if (!more) {
@@ -384,7 +409,7 @@
                     more.className = 'btn-cancel';
                     more.style.cssText = 'display:block; margin:20px auto; padding:10px 30px;';
                     more.textContent = '加载更多';
-                    more.onclick = () => { myRegPage += 1; loadMyRegistrations(false); };
+                    more.onclick = () => loadMyRegistrations(false);
                     listDiv.parentElement.appendChild(more);
                 }
                 more.style.display = myRegPage < myRegPages ? 'block' : 'none';
@@ -396,9 +421,10 @@
             }
         }
 
-        async function cancelRegistration(registrationId) {
+        async function cancelRegistration(registrationId, btn) {
             const ok = await showConfirm('确定要取消报名吗？取消后名额将释放。');
             if (!ok) return;
+            if (btn) { btn.disabled = true; btn.textContent = '取消中…'; }
             try {
                 const response = await fetch(`/api/cancel_registration/${registrationId}`, { method: 'PUT' });
                 const data = await response.json();
@@ -407,9 +433,39 @@
                     loadMyRegistrations();
                 } else {
                     showToast('✗ ' + data.message);
+                    if (btn) { btn.disabled = false; btn.textContent = '取消报名'; }
                 }
             } catch (error) {
                 showToast('⚠ 网络错误，请检查后端');
+                if (btn) { btn.disabled = false; btn.textContent = '取消报名'; }
+            }
+        }
+
+        async function changePassword(btn) {
+            const oldPwd = document.getElementById('old-password').value;
+            const newPwd = document.getElementById('new-password').value;
+            if (!oldPwd || !newPwd) { showToast('⚠ 请填写旧密码和新密码'); return; }
+            if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+            try {
+                const response = await fetch('/api/change_password', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ old_password: oldPwd, new_password: newPwd })
+                });
+                const data = await response.json();
+                if (data.code === 200) {
+                    showToast('✓ ' + data.message);
+                    // 旧令牌已失效，直接用返回的新令牌续上，或重新登录
+                    if (data.token) localStorage.setItem('token', data.token);
+                    document.getElementById('old-password').value = '';
+                    document.getElementById('new-password').value = '';
+                } else {
+                    showToast('✗ ' + data.message);
+                }
+            } catch (error) {
+                showToast('⚠ 网络错误，请检查后端');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '确认修改'; }
             }
         }
 

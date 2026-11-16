@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS `comments` (
   `event_id` int NOT NULL,
   `user_id` int NOT NULL,
   `content` text COLLATE utf8mb4_unicode_ci NOT NULL,
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `created_at` datetime NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`comment_id`),
   KEY `user_id` (`user_id`),
   KEY `idx_event` (`event_id`),
@@ -95,8 +95,11 @@ CREATE TABLE IF NOT EXISTS `registrations` (
   PRIMARY KEY (`registration_id`),
   UNIQUE KEY `uk_student_event` (`student_id`,`event_id`),
   KEY `event_id` (`event_id`),
+  KEY `idx_reg_event_status` (`event_id`,`status`),
+  KEY `idx_reg_cancelled_by` (`cancelled_by`),
   CONSTRAINT `registrations_ibfk_1` FOREIGN KEY (`student_id`) REFERENCES `users` (`user_id`) ON DELETE CASCADE,
-  CONSTRAINT `registrations_ibfk_2` FOREIGN KEY (`event_id`) REFERENCES `events` (`event_id`) ON DELETE CASCADE
+  CONSTRAINT `registrations_ibfk_2` FOREIGN KEY (`event_id`) REFERENCES `events` (`event_id`) ON DELETE CASCADE,
+  CONSTRAINT `registrations_ibfk_3` FOREIGN KEY (`cancelled_by`) REFERENCES `users` (`user_id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
@@ -109,7 +112,9 @@ CREATE TABLE IF NOT EXISTS `users` (
   `email` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
   `password_hash` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
   `role` enum('student','organizer','admin') COLLATE utf8mb4_unicode_ci DEFAULT 'student',
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  -- token_version：登出 / 改密码时 +1，使所有已签发的旧令牌立即失效
+  `token_version` int NOT NULL DEFAULT 0,
+  `created_at` datetime NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`user_id`),
   UNIQUE KEY `email` (`email`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

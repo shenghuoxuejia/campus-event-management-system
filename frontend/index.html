@@ -579,9 +579,12 @@
         }
 
         function logout() {
-            localStorage.removeItem('user');
-            localStorage.removeItem('token');
-            window.location.href = 'login.html';
+            // 先通知后端吊销令牌（失败也不阻塞退出），再清本地存储
+            fetch('/api/logout', { method: 'POST' }).catch(() => {}).finally(() => {
+                localStorage.removeItem('user');
+                localStorage.removeItem('token');
+                window.location.href = 'login.html';
+            });
         }
 
         // 删除活动
@@ -619,7 +622,8 @@
                 const response = await fetch(`/api/close_event/${eventId}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: newStatus })
+                    // 后端只接受 close / open，不能直接传 'closed'
+                    body: JSON.stringify({ action: newStatus === 'closed' ? 'close' : 'open' })
                 });
                 const data = await response.json();
                 if (data.code === 200) {
@@ -643,8 +647,9 @@
             card.className = 'event-card';
 
             const isClosed = event.status === 'closed';
-            const isEnded = event.ended;
-            const isStarted = event.started && !event.ended;
+            // 后端列表接口已返回 started / ended（由数据库 NOW() 计算，不信前端时钟）
+            const isEnded = Boolean(event.ended);
+            const isStarted = Boolean(event.started) && !isEnded;
             const isOpen = !isClosed && !isStarted && !isEnded;
             const isRegistered = event.is_registered > 0;
             const isOwner = ownerOf(event);
@@ -690,45 +695,59 @@
             return card;
         }
 
-        async function loadEvents(reset = true) {
-            const isRefresh = (reset === 'refresh');
-            if (reset === true) { eventPage = 1; eventsCache = []; }
-            const listDiv = document.getElementById('event-list');
-            try {
-                let url = `/api/events?page=${eventPage}&page_size=12`;
-                if (currentCategoryFilter) url += `&category_id=${currentCategoryFilter}`;
-                const response = await fetch(url);
-                const result = await response.json();
-                if (result.code !== 200) {
-                    if (reset === true || isRefresh) {
-                        listDiv.innerHTML = `<p style="color:#fa5151; text-align:center; grid-column:1/-1;">${escapeHtml(result.message || '加载失败')}</p>`;
-                    }
-                    return;
-                }
-                if (reset === true || isRefresh) {
-                    listDiv.innerHTML = '';
-                    eventsCache = [];
-                }
-                eventsCache = eventsCache.concat(result.data);
-                result.data.forEach(event => listDiv.appendChild(createEventCard(event)));
+        async function loadEvents(mode = 'reset') {
+            // 兼容旧调用：loadEvents(true/false) / loadEvents('refresh')
+            if (mode === true) mode = 'reset';
+            else if (mode === false) mode = 'more';
 
-                if ((reset === true || isRefresh) && result.data.length === 0) {
+            const listDiv = document.getElementById('event-list');
+            const moreBtn = document.getElementById('load-more-events');
+            // reset：从第 1 页重拉；more：追加下一页；
+            // refresh：保持当前页码，但把 1..N 页全部重新拉一遍（缓存完整、页码不丢）
+            const targetPage = mode === 'reset' ? 1 : (mode === 'more' ? eventPage + 1 : eventPage);
+            const firstPage = mode === 'more' ? targetPage : 1;
+
+            try {
+                let items = [];
+                let pages = 0;
+                for (let p = firstPage; p <= targetPage; p++) {
+                    let url = `/api/events?page=${p}&page_size=12`;
+                    if (currentCategoryFilter) url += `&category_id=${currentCategoryFilter}`;
+                    const response = await fetch(url);
+                    const result = await response.json();
+                    if (result.code !== 200) {
+                        if (mode !== 'more') {
+                            listDiv.innerHTML = `<p style="color:#fa5151; text-align:center; grid-column:1/-1;">${escapeHtml(result.message || '加载失败')}</p>`;
+                        }
+                        moreBtn.style.display = 'none';
+                        return;
+                    }
+                    items = items.concat(result.data);
+                    pages = result.pages || 0;
+                    if (p >= pages) break;
+                }
+
+                eventPage = targetPage;
+                eventPages = pages;
+                eventsCache = items;
+                listDiv.innerHTML = '';
+                items.forEach(event => listDiv.appendChild(createEventCard(event)));
+                if (items.length === 0) {
                     listDiv.innerHTML = '<p style="text-align:center; color:#888; grid-column:1/-1;">暂无活动。</p>';
                 }
-                eventPages = result.pages;
-                document.getElementById('load-more-events').style.display =
-                    eventPage < eventPages ? 'inline-block' : 'none';
+                moreBtn.style.display = eventPage < eventPages ? 'inline-block' : 'none';
             } catch (error) {
                 console.error(error);
-                if (reset === true || isRefresh) {
+                if (mode !== 'more') {
                     listDiv.innerHTML = '<p style="color:#fa5151; text-align:center; grid-column:1/-1;">无法连接后端，请确认后端已启动。</p>';
                 }
+                moreBtn.style.display = 'none';
             }
         }
 
         function loadMoreEvents() {
-            eventPage += 1;
-            loadEvents(false);
+            // 页码在请求成功后才推进（loadEvents 内部处理），失败不会跳过一页
+            loadEvents('more');
         }
 
         // 报名
@@ -809,6 +828,10 @@
             }
 
             const isEdit = !!editingEventId;
+            const btn = document.getElementById('publish-btn');
+            if (btn.disabled) return;           // 防连点：双击不会重复发布
+            btn.disabled = true;
+            btn.textContent = isEdit ? '保存中…' : '发布中…';
             try {
                 const response = await fetch(isEdit ? `/api/update_event/${editingEventId}` : '/api/create_event', {
                     method: isEdit ? 'PUT' : 'POST',
@@ -832,6 +855,9 @@
                 }
             } catch (error) {
                 showToast('⚠ 网络错误');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = editingEventId ? '保存修改' : '发布活动';
             }
         }
 
@@ -911,6 +937,7 @@
 
         // 活动详情弹窗
         let currentEvent = null;
+        let currentEventId = null;
 
         async function openDetail(eventId) {
             currentEventId = eventId;
@@ -943,20 +970,26 @@
         function createRegRow(reg) {
             const item = document.createElement('div');
             item.className = 'reg-item';
+            const isCancelled = reg.registration_status === 'cancelled';
             const isCheckedIn = reg.registration_status === 'checked_in';
-            const checkinBtn = isCheckedIn
-                ? `<span class="checkin-status">✓ 已签到</span>
-                   <button class="btn-undo-checkin" onclick="undoCheckIn(${reg.registration_id}, this)">撤销签到</button>`
-                : `<button class="btn-checkin" onclick="checkInStudent(${reg.registration_id}, this)">签到</button>`;
+            let actionHtml;
+            if (isCancelled) {
+                const who = reg.cancelled_by_name ? `（${escapeHtml(reg.cancelled_by_name)} 操作）` : '';
+                const when = reg.cancelled_at ? formatDateTime(reg.cancelled_at) : '';
+                actionHtml = `<span class="checkin-status">已取消${who} ${when}</span>`;
+            } else if (isCheckedIn) {
+                actionHtml = `<span class="checkin-status">✓ 已签到</span>
+                   <button class="btn-undo-checkin" onclick="undoCheckIn(${reg.registration_id}, this)">撤销签到</button>`;
+            } else {
+                actionHtml = `<button class="btn-checkin" onclick="checkInStudent(${reg.registration_id}, this)">签到</button>
+                   <button class="btn-remove" onclick="removeRegistration(${reg.registration_id})">移除</button>`;
+            }
             item.innerHTML = `
                 <div>
                     <div class="name">${escapeHtml(reg.student_name)}</div>
                     <div class="email">${escapeHtml(reg.student_email)}</div>
                 </div>
-                <div>
-                    ${checkinBtn}
-                    <button class="btn-remove" onclick="removeRegistration(${reg.registration_id})">移除</button>
-                </div>
+                <div>${actionHtml}</div>
             `;
             return item;
         }
@@ -964,12 +997,15 @@
         async function loadEventRegistrations(eventId, reset = true) {
             const listDiv = document.getElementById('registration-list-detail');
             const moreBtn = document.getElementById('load-more-regs');
+            const targetPage = reset ? 1 : regPage + 1;
             if (reset) {
-                regPage = 1;
                 listDiv.innerHTML = '<p class="empty-tip">加载中...</p>';
             }
             try {
-                const res = await fetch(`/api/event_registrations/${eventId}?page=${regPage}&page_size=20`);
+                const withCancelled = document.getElementById('show-cancelled')
+                    && document.getElementById('show-cancelled').checked;
+                const query = `page=${targetPage}&page_size=20` + (withCancelled ? '&include_cancelled=1' : '');
+                const res = await fetch(`/api/event_registrations/${eventId}?${query}`);
                 const result = await res.json();
                 if (result.code !== 200) {
                     listDiv.innerHTML = `<p class="empty-tip" style="color:#fa5151;">${escapeHtml(result.message || '加载失败')}</p>`;
@@ -980,6 +1016,7 @@
                 if (reset && result.data.length === 0) {
                     listDiv.innerHTML = '<p class="empty-tip">暂时还没有人报名</p>';
                 }
+                regPage = targetPage;
                 result.data.forEach(reg => listDiv.appendChild(createRegRow(reg)));
                 regPages = result.pages;
                 moreBtn.style.display = regPage < regPages ? 'inline-block' : 'none';
@@ -990,7 +1027,6 @@
         }
 
         function loadMoreRegs() {
-            regPage += 1;
             loadEventRegistrations(currentEventId, false);
         }
 
@@ -1105,12 +1141,12 @@
         async function loadComments(eventId, reset = true) {
             const listDiv = document.getElementById('comment-list');
             const moreBtn = document.getElementById('load-more-comments');
+            const targetPage = reset ? 1 : commentPage + 1;
             if (reset) {
-                commentPage = 1;
                 listDiv.innerHTML = '<p class="empty-tip">加载中...</p>';
             }
             try {
-                const res = await fetch(`/api/comments/${eventId}?page=${commentPage}&page_size=20`);
+                const res = await fetch(`/api/comments/${eventId}?page=${targetPage}&page_size=20`);
                 const result = await res.json();
                 if (result.code !== 200) {
                     listDiv.innerHTML = `<p class="empty-tip" style="color:#fa5151;">${escapeHtml(result.message || '加载失败')}</p>`;
@@ -1125,6 +1161,7 @@
                     currentUser.role === 'admin' ||
                     (currentUser.role === 'organizer' && currentEvent.organizer_id === currentUser.user_id)
                 ));
+                commentPage = targetPage;
                 result.data.forEach(c => listDiv.appendChild(createCommentRow(c, canManage)));
                 commentPages = result.pages;
                 moreBtn.style.display = commentPage < commentPages ? 'inline-block' : 'none';
@@ -1135,7 +1172,6 @@
         }
 
         function loadMoreComments() {
-            commentPage += 1;
             loadComments(currentEventId, false);
         }
 
@@ -1174,14 +1210,16 @@
         
         async function loadAdminUsers(reset = true) {
             const box = document.getElementById('admin-user-list');
+            const targetPage = reset ? 1 : adminUserPage + 1;
             if (reset) box.innerHTML = '<p class="empty-tip">加载中...</p>';
             try {
-                const res = await fetch(`/api/admin/users?page=${adminUserPage}&page_size=50`);
+                const res = await fetch(`/api/admin/users?page=${targetPage}&page_size=50`);
                 const result = await res.json();
                 if (result.code !== 200) {
                     if (reset) box.innerHTML = `<p class="empty-tip" style="color:#fa5151;">${escapeHtml(result.message || '加载失败')}</p>`;
                     return;
                 }
+                adminUserPage = targetPage;
                 const html = result.data.map(u => `
                     <div class="reg-item">
                         <div>
@@ -1205,10 +1243,7 @@
                     more.className = 'btn-toggle';
                     more.style.cssText = 'display:block; margin:15px auto 0;';
                     more.textContent = '加载更多用户';
-                    more.onclick = () => {
-                        adminUserPage += 1;
-                        loadAdminUsers(false);
-                    };
+                    more.onclick = () => loadAdminUsers(false);
                     box.appendChild(more);
                 }
                 more.style.display = adminUserPage < adminUserPages ? 'inline-block' : 'none';
@@ -1231,7 +1266,12 @@
             </div>
             <div class="modal-body">
                 <div class="section" id="registration-section">
-                    <h4>👥 报名名单</h4>
+                    <h4>👥 报名名单
+                        <label style="font-size:12px; font-weight:normal; color:#888; margin-left:10px; cursor:pointer;">
+                            <input type="checkbox" id="show-cancelled"
+                                   onchange="loadEventRegistrations(currentEventId, true)"> 显示已取消
+                        </label>
+                    </h4>
                     <div id="registration-list-detail"></div>
                     <div style="text-align:center;">
                         <button class="btn-toggle" id="load-more-regs" style="display:none;" onclick="loadMoreRegs()">加载更多报名</button>

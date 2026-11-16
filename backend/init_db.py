@@ -32,7 +32,117 @@ DB_NAME_RE = re.compile(r'^[A-Za-z0-9_]+$')
 # init_db.py 在「库已存在」时也会幂等补齐，方便老库升级。
 REQUIRED_INDEXES = [
     ('events', 'idx_start_time', '(`start_time`)'),
+    ('events', 'idx_events_venue_time', '(`venue_id`, `start_time`, `end_time`)'),
+    ('events', 'idx_events_org_start', '(`organizer_id`, `start_time`)'),
+    ('comments', 'idx_comments_event_created', '(`event_id`, `created_at`)'),
+    ('registrations', 'idx_reg_event_status', '(`event_id`, `status`)'),
+    ('registrations', 'idx_reg_cancelled_by', '(`cancelled_by`)'),
 ]
+
+# 后续版本新增的列：(表名, 列名, 列定义)
+# 老库直接跑 init_db.py 会把这些列补上，避免应用报 1054 Unknown column。
+REQUIRED_COLUMNS = [
+    ('users', 'token_version', 'int NOT NULL DEFAULT 0'),
+    ('registrations', 'cancelled_at', 'datetime DEFAULT NULL'),
+    ('registrations', 'cancelled_by', 'int DEFAULT NULL'),
+    ('registrations', 'updated_at',
+     'datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'),
+    ('events', 'updated_at',
+     'datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'),
+]
+
+# 早期版本用 TIMESTAMP，会随会话时区换算且有 2038 上限；统一改成 DATETIME
+DATETIME_COLUMNS = [
+    ('users', 'created_at', 'datetime NULL DEFAULT CURRENT_TIMESTAMP'),
+    ('comments', 'created_at', 'datetime NULL DEFAULT CURRENT_TIMESTAMP'),
+]
+
+# 外键要求：(表名, 约束名, 定义, 期望的 DELETE_RULE)
+REQUIRED_FOREIGN_KEYS = [
+    ('registrations', 'registrations_ibfk_2',
+     'FOREIGN KEY (`event_id`) REFERENCES `events` (`event_id`) ON DELETE CASCADE',
+     'CASCADE'),
+    ('registrations', 'registrations_ibfk_3',
+     'FOREIGN KEY (`cancelled_by`) REFERENCES `users` (`user_id`) ON DELETE SET NULL',
+     'SET NULL'),
+]
+
+
+def ensure_columns(conn, dbname):
+    """补齐缺失的列（幂等）。返回新增的列个数。"""
+    added = 0
+    with closing(conn.cursor()) as cur:
+        for table, column, definition in REQUIRED_COLUMNS:
+            cur.execute(
+                'SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS '
+                'WHERE TABLE_SCHEMA = %s AND LOWER(TABLE_NAME) = LOWER(%s) '
+                'AND LOWER(COLUMN_NAME) = LOWER(%s)',
+                (dbname, table, column),
+            )
+            if cur.fetchone()[0] == 0:
+                cur.execute(
+                    f'ALTER TABLE `{dbname}`.`{table}` ADD COLUMN `{column}` {definition}'
+                )
+                added += 1
+    conn.commit()
+    return added
+
+
+def ensure_datetime_columns(conn, dbname):
+    """把早期版本的 TIMESTAMP 列统一改成 DATETIME（幂等）。返回改动个数。"""
+    changed = 0
+    with closing(conn.cursor()) as cur:
+        # 先统一会话时区，保证 TIMESTAMP → DATETIME 转换不会整体偏移
+        cur.execute("SET time_zone = '+08:00'")
+        for table, column, definition in DATETIME_COLUMNS:
+            cur.execute(
+                'SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS '
+                'WHERE TABLE_SCHEMA = %s AND LOWER(TABLE_NAME) = LOWER(%s) '
+                'AND LOWER(COLUMN_NAME) = LOWER(%s)',
+                (dbname, table, column),
+            )
+            row = cur.fetchone()
+            if row and str(row[0]).lower() == 'timestamp':
+                cur.execute(
+                    f'ALTER TABLE `{dbname}`.`{table}` MODIFY COLUMN `{column}` {definition}'
+                )
+                changed += 1
+    conn.commit()
+    return changed
+
+
+def ensure_foreign_keys(conn, dbname):
+    """补齐 / 修正外键的级联规则（幂等）。返回改动个数。"""
+    changed = 0
+    with closing(conn.cursor()) as cur:
+        for table, name, definition, expected_rule in REQUIRED_FOREIGN_KEYS:
+            cur.execute(
+                'SELECT DELETE_RULE FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS '
+                'WHERE CONSTRAINT_SCHEMA = %s AND CONSTRAINT_NAME = %s',
+                (dbname, name),
+            )
+            row = cur.fetchone()
+            if row:
+                if str(row[0]).upper().replace('_', ' ') == expected_rule:
+                    continue
+                cur.execute(f'ALTER TABLE `{dbname}`.`{table}` DROP FOREIGN KEY `{name}`')
+            try:
+                cur.execute(f'ALTER TABLE `{dbname}`.`{table}` ADD CONSTRAINT `{name}` {definition}')
+                changed += 1
+            except mysql.connector.Error as err:
+                print(f'[警告] 补外键 {name} 失败（老数据可能有脏值）：{err}')
+    conn.commit()
+    return changed
+
+
+def migrate_existing_db(conn, dbname):
+    """对已存在的库做幂等升级：列 → 类型 → 外键 → 索引。返回改动项汇总。"""
+    return {
+        'columns': ensure_columns(conn, dbname),
+        'datetime': ensure_datetime_columns(conn, dbname),
+        'foreign_keys': ensure_foreign_keys(conn, dbname),
+        'indexes': ensure_indexes(conn, dbname),
+    }
 
 
 def ensure_indexes(conn, dbname):
@@ -142,11 +252,17 @@ def main():
                 has_tables = cur.fetchone()[0] > 0
 
             if has_tables and not force:
-                print(f'数据库 `{dbname}` 已存在且已建表，跳过初始化。')
-                # 老库升级：幂等补齐后续版本新增的索引
-                added = ensure_indexes(conn, dbname)
-                if added:
-                    print(f'已补充 {added} 个缺失的索引。')
+                print(f'数据库 `{dbname}` 已存在且已建表，跳过建表。')
+                # 老库升级：幂等补齐后续版本新增的列 / 索引 / 外键
+                changes = migrate_existing_db(conn, dbname)
+                if any(changes.values()):
+                    print('已升级老库：'
+                          f"新增列 {changes['columns']} 个，"
+                          f"时间类型修正 {changes['datetime']} 个，"
+                          f"外键 {changes['foreign_keys']} 个，"
+                          f"索引 {changes['indexes']} 个。")
+                else:
+                    print('库结构已是最新，无需升级。')
                 print('（如需重建，运行：python backend/init_db.py --force）')
                 return 0
 
@@ -174,7 +290,7 @@ def main():
             for stmt in statements:
                 cur.execute(stmt)
             conn.commit()
-        ensure_indexes(conn, dbname)
+        migrate_existing_db(conn, dbname)
     except mysql.connector.Error as err:
         conn.rollback()
         print(f'[错误] 执行建表语句失败：{err}')

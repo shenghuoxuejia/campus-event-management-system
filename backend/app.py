@@ -52,6 +52,9 @@ db_config = {
     'password': os.environ.get('DB_PASSWORD'),          # 必填，见 .env.example
     'database': os.environ.get('DB_NAME', 'campus_events'),
     'charset': 'utf8mb4',
+    # 会话时区固定为东八区：所有 NOW() 判断都基于同一时区，
+    # 避免 MySQL 服务器时区为 UTC 时「报名/签到时间窗」整体偏 8 小时。
+    'time_zone': os.environ.get('DB_TIME_ZONE', '+08:00'),
 }
 APP_SECRET_KEY = os.environ.get('APP_SECRET_KEY')       # 必填，见 .env.example
 TOKEN_MAX_AGE = int(os.environ.get('TOKEN_MAX_AGE', '86400'))  # 令牌有效期（秒），默认 24 小时
@@ -117,7 +120,7 @@ def _get_pool():
     if _db_pool is None:
         _db_pool = pooling.MySQLConnectionPool(
             pool_name='campus_events_pool',
-            pool_size=5,
+            pool_size=int(os.environ.get('DB_POOL_SIZE', '5')),
             connection_timeout=5,
             **db_config,
         )
@@ -125,8 +128,21 @@ def _get_pool():
 
 
 def get_conn():
-    """从连接池取一个数据库连接。调用方负责关闭（归还池）。"""
-    return _get_pool().get_connection()
+    """从连接池取一个数据库连接。调用方负责关闭（归还池）。
+
+    MySQL 侧 wait_timeout 到期后池里可能是死连接，取出后先 ping 一次
+    （reconnect=True 会自动重连），避免偶发 500。
+    """
+    conn = _get_pool().get_connection()
+    try:
+        conn.ping(reconnect=True, attempts=1, delay=0)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = _get_pool().get_connection()
+    return conn
 
 
 @contextmanager
@@ -153,20 +169,25 @@ def db_cursor(*, commit=False):
         conn.close()
 
 
-def issue_token(user_id):
-    """为用户签发令牌。"""
-    return serializer.dumps({'uid': user_id})
+def issue_token(user_id, token_version=0):
+    """为用户签发令牌（带 token_version，登出/改密后旧令牌立即失效）。"""
+    return serializer.dumps({'uid': user_id, 'tv': int(token_version or 0)})
+
+
+def _load_user_row(user_id, include_version=False):
+    """按主键读取用户；include_version=True 时额外带上 token_version（仅供鉴权）。"""
+    columns = 'user_id, name, email, role, created_at'
+    if include_version:
+        columns += ', token_version'
+    with closing(get_conn()) as conn, closing(conn.cursor(dictionary=True)) as cur:
+        cur.execute(f"SELECT {columns} FROM users WHERE user_id = %s", (user_id,))
+        return cur.fetchone()
 
 
 def load_user(user_id):
-    """按主键读取用户（只取安全字段）。"""
-    with closing(get_conn()) as conn, closing(conn.cursor(dictionary=True)) as cur:
-        cur.execute(
-            "SELECT user_id, name, email, role, created_at FROM Users WHERE user_id = %s",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        return fmt_row(row, 'created_at') if row is not None else row
+    """按主键读取用户（只取安全字段，不含 token_version）。"""
+    row = _load_user_row(user_id)
+    return fmt_row(row, 'created_at') if row is not None else row
 
 
 def auth_user():
@@ -183,7 +204,15 @@ def auth_user():
         return None
     except BadSignature:
         return None
-    return load_user(payload.get('uid'))
+
+    row = _load_user_row(payload.get('uid'), include_version=True)
+    if row is None:
+        return None
+    # token_version 不一致说明用户已登出 / 改过密码，旧令牌作废
+    if int(payload.get('tv') or 0) != int(row.get('token_version') or 0):
+        return None
+    row.pop('token_version', None)
+    return fmt_row(row, 'created_at')
 
 
 def require_user():
@@ -293,6 +322,7 @@ def _parse_rate_limit(env_name, default):
 
 LOGIN_RATE_LIMIT = _parse_rate_limit('LOGIN_RATE_LIMIT', (10, 60))
 REGISTER_RATE_LIMIT = _parse_rate_limit('REGISTER_RATE_LIMIT', (20, 3600))
+COMMENT_RATE_LIMIT = _parse_rate_limit('COMMENT_RATE_LIMIT', (20, 60))
 
 
 _TRUSTED_PROXIES = {
@@ -379,12 +409,24 @@ def _validate_datetime(value, field_label):
 
 
 def _get_venue(cur, venue_id):
+    """读取可用场地；FOR UPDATE 让同一场地的发布/编辑串行化，
+    否则两个并发发布可能同时通过「场地时间冲突」检查而真正撞场地。"""
     cur.execute(
-        "SELECT venue_id, capacity FROM Venues "
-        "WHERE venue_id = %s AND available_status = 1",
+        "SELECT venue_id, capacity FROM venues "
+        "WHERE venue_id = %s AND available_status = 1 FOR UPDATE",
         (venue_id,),
     )
     return cur.fetchone()
+
+
+def _fmt_dt(value):
+    """把 datetime / 字符串统一成 'YYYY-MM-DD HH:MM:SS' 便于比较。"""
+    if value is None:
+        return ''
+    try:
+        return value.strftime('%Y-%m-%d %H:%M:%S')
+    except AttributeError:
+        return str(value)
 
 
 def _is_time_order_valid(cur, start, end):
@@ -406,7 +448,7 @@ def _is_start_in_future(cur, start):
 
 def _require_event_owner(cur, event_id, user, deny_message="无权操作该活动"):
     """校验当前用户是否为活动组织者（管理员放行）；是则返回活动行，否则抛 AppError。"""
-    cur.execute("SELECT organizer_id FROM Events WHERE event_id = %s", (event_id,))
+    cur.execute("SELECT organizer_id FROM events WHERE event_id = %s", (event_id,))
     event = cur.fetchone()
     if not event:
         raise AppError("活动不存在", code=404, http_status=404)
@@ -422,7 +464,7 @@ def _lock_event(cur, event_id):
         SELECT capacity, status,
                (NOW() > start_time) AS started,
                (end_time IS NOT NULL AND NOW() > end_time) AS ended
-        FROM Events WHERE event_id = %s FOR UPDATE
+        FROM events WHERE event_id = %s FOR UPDATE
         """,
         (event_id,),
     )
@@ -431,7 +473,7 @@ def _lock_event(cur, event_id):
 
 def _get_registration_for_update(cur, user_id, event_id):
     cur.execute(
-        "SELECT registration_id, status FROM Registrations "
+        "SELECT registration_id, status FROM registrations "
         "WHERE student_id = %s AND event_id = %s FOR UPDATE",
         (user_id, event_id),
     )
@@ -440,7 +482,7 @@ def _get_registration_for_update(cur, user_id, event_id):
 
 def _count_active_registrations(cur, event_id):
     cur.execute(
-        "SELECT COUNT(*) AS cnt FROM Registrations "
+        "SELECT COUNT(*) AS cnt FROM registrations "
         "WHERE event_id = %s AND status <> 'cancelled'",
         (event_id,),
     )
@@ -450,23 +492,30 @@ def _count_active_registrations(cur, event_id):
 def _upsert_registration(cur, existing, user_id, event_id):
     """报名或重新报名。返回 (提示语, registration_id)。"""
     if existing:
+        # 保留首次报名时间：排队顺序和「第几次报名」的历史不会被重新报名覆盖
         cur.execute(
-            "UPDATE Registrations SET status = 'registered', registered_at = NOW(), "
+            "UPDATE registrations SET status = 'registered', "
             "check_in_time = NULL, cancelled_at = NULL, cancelled_by = NULL "
-            "WHERE registration_id = %s",
+            "WHERE registration_id = %s AND status = 'cancelled'",
             (existing['registration_id'],),
         )
+        if cur.rowcount != 1:
+            raise AppError("该报名状态已变化，请刷新后重试", code=409, http_status=409)
         return "重新报名成功！", existing['registration_id']
     cur.execute(
-        "INSERT INTO Registrations (student_id, event_id, status) "
+        "INSERT INTO registrations (student_id, event_id, status) "
         "VALUES (%s, %s, 'registered')",
         (user_id, event_id),
     )
     return "报名成功！", cur.lastrowid
 
 
-def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=None):
-    """校验并规整「发布 / 编辑活动」的字段，返回可直接写入数据库的 dict。"""
+def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=None, current=None):
+    """校验并规整「发布 / 编辑活动」的字段，返回可直接写入数据库的 dict。
+
+    current 为编辑时库里的旧值（venue_id / start_time / end_time）；
+    场地与时间段都没变时跳过冲突重检，避免老数据本来就重叠时连标题都改不了。
+    """
     title = (data.get('title') or '').strip()
     description = (data.get('description') or '').strip()
     venue_id = data.get('venue_id')
@@ -505,20 +554,27 @@ def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=
 
     # 场地时间冲突校验：同场地、不同活动、时间段有交集
     # 区间重叠判断：existing.start < new.end AND existing.end > new.start
-    cur.execute(
-        """
-        SELECT event_id FROM Events
-         WHERE venue_id = %s
-           AND event_id <> %s
-           AND start_time < %s
-           AND end_time > %s
-         LIMIT 1
-         FOR UPDATE
-        """,
-        (venue['venue_id'], exclude_event_id or 0, end_time, start_time),
+    unchanged = bool(
+        current
+        and venue['venue_id'] == current.get('venue_id')
+        and start_time == _fmt_dt(current.get('start_time'))
+        and end_time == _fmt_dt(current.get('end_time'))
     )
-    if cur.fetchone():
-        raise AppError("该场地在该时间段已被占用，请更换场地或时间")
+    if not unchanged:
+        cur.execute(
+            """
+            SELECT event_id FROM events
+             WHERE venue_id = %s
+               AND event_id <> %s
+               AND start_time < %s
+               AND end_time > %s
+             LIMIT 1
+             FOR UPDATE
+            """,
+            (venue['venue_id'], exclude_event_id or 0, end_time, start_time),
+        )
+        if cur.fetchone():
+            raise AppError("该场地在该时间段已被占用，请更换场地或时间")
 
     return {
         'title': title,
@@ -555,7 +611,7 @@ def _ensure_categories_exist(cur, category_ids):
         return
     placeholders = ','.join(['%s'] * len(category_ids))
     cur.execute(
-        f"SELECT category_id FROM Categories WHERE category_id IN ({placeholders})",
+        f"SELECT category_id FROM categories WHERE category_id IN ({placeholders})",
         tuple(category_ids),
     )
     found = {row['category_id'] for row in cur.fetchall()}
@@ -569,10 +625,10 @@ def _apply_event_categories(cur, event_id, raw_category_ids):
     category_ids = _parse_category_ids(raw_category_ids)
     if category_ids:
         _ensure_categories_exist(cur, category_ids)
-    cur.execute("DELETE FROM Event_Categories WHERE event_id = %s", (event_id,))
+    cur.execute("DELETE FROM event_categories WHERE event_id = %s", (event_id,))
     for cid in category_ids:
         cur.execute(
-            "INSERT INTO Event_Categories (event_id, category_id) VALUES (%s, %s)",
+            "INSERT INTO event_categories (event_id, category_id) VALUES (%s, %s)",
             (event_id, cid),
         )
     return category_ids
@@ -606,7 +662,7 @@ def register():
     try:
         with db_cursor(commit=True) as cur:
             cur.execute(
-                "INSERT INTO Users (name, email, password_hash, role) VALUES (%s, %s, %s, %s)",
+                "INSERT INTO users (name, email, password_hash, role) VALUES (%s, %s, %s, %s)",
                 (name, email, hashed, role),
             )
     except mysql.connector.Error as err:
@@ -633,7 +689,7 @@ def login():
 
     try:
         with db_cursor() as cur:
-            cur.execute("SELECT * FROM Users WHERE email = %s", (email,))
+            cur.execute("SELECT * FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
     except mysql.connector.Error:
         app.logger.exception("登录查询失败")
@@ -643,9 +699,11 @@ def login():
     if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
         raise AppError("邮箱或密码错误")
 
+    token = issue_token(user['user_id'], user.get('token_version', 0))
     user.pop('password_hash', None)
+    user.pop('token_version', None)
     reset_rate_limit(login_key)
-    return ok("登录成功", data=fmt_row(user, 'created_at'), token=issue_token(user['user_id']))
+    return ok("登录成功", data=fmt_row(user, 'created_at'), token=token)
 
 
 # 获取活动列表
@@ -668,7 +726,7 @@ def get_events():
     cat_where = ''
     cat_params = []
     if category_id:
-        cat_where = ' AND e.event_id IN (SELECT event_id FROM Event_Categories WHERE category_id = %s)'
+        cat_where = ' AND e.event_id IN (SELECT event_id FROM event_categories WHERE category_id = %s)'
         cat_params = [category_id]
 
     sql = f"""
@@ -676,22 +734,24 @@ def get_events():
             e.event_id, e.title, e.description, e.organizer_id, e.venue_id,
             e.start_time, e.end_time, e.capacity, e.status,
             v.venue_name, v.location AS venue_location,
-            (SELECT COUNT(*) FROM Registrations r
+            (NOW() > e.start_time) AS started,
+            (e.end_time < NOW()) AS ended,
+            (SELECT COUNT(*) FROM registrations r
               WHERE r.event_id = e.event_id AND r.status <> 'cancelled') AS registered_count,
-            (SELECT COUNT(*) FROM Registrations r
+            (SELECT COUNT(*) FROM registrations r
               WHERE r.event_id = e.event_id AND r.student_id = %s
                 AND r.status <> 'cancelled') AS is_registered
-        FROM Events e
-        LEFT JOIN Venues v ON e.venue_id = v.venue_id
+        FROM events e
+        LEFT JOIN venues v ON e.venue_id = v.venue_id
         WHERE 1=1{cat_where}
-        ORDER BY (e.end_time IS NOT NULL AND e.end_time < NOW()) ASC,
+        ORDER BY (e.end_time < NOW()) ASC,
                  e.start_time ASC, e.event_id ASC
         LIMIT %s OFFSET %s
     """
     try:
         with db_cursor() as cur:
             cur.execute(
-                f"SELECT COUNT(*) AS total FROM Events e WHERE 1=1{cat_where}",
+                f"SELECT COUNT(*) AS total FROM events e WHERE 1=1{cat_where}",
                 tuple(cat_params),
             )
             total = cur.fetchone()['total']
@@ -708,8 +768,8 @@ def get_events():
                 cur.execute(
                     f"""
                     SELECT ec.event_id, c.category_id, c.category_name
-                    FROM Event_Categories ec
-                    JOIN Categories c ON ec.category_id = c.category_id
+                    FROM event_categories ec
+                    JOIN categories c ON ec.category_id = c.category_id
                     WHERE ec.event_id IN ({placeholders})
                     ORDER BY c.category_id ASC
                     """,
@@ -725,6 +785,8 @@ def get_events():
 
     for e in events:
         fmt_row(e, 'start_time', 'end_time')
+        e['started'] = bool(e.get('started'))
+        e['ended'] = bool(e.get('ended'))
         registered = int(e.get('registered_count') or 0)
         capacity = int(e.get('capacity') or 0)
         e['remaining'] = max(capacity - registered, 0)
@@ -744,16 +806,16 @@ def get_event_detail(event_id):
                        e.start_time, e.end_time, e.capacity, e.status, e.updated_at,
                        v.venue_name, v.location AS venue_location,
                        u.name AS organizer_name,
-                       (SELECT COUNT(*) FROM Registrations r
+                       (SELECT COUNT(*) FROM registrations r
                          WHERE r.event_id = e.event_id AND r.status <> 'cancelled') AS registered_count,
-                       (SELECT COUNT(*) FROM Registrations r
+                       (SELECT COUNT(*) FROM registrations r
                          WHERE r.event_id = e.event_id AND r.student_id = %s
                            AND r.status <> 'cancelled') AS is_registered,
                        (NOW() > e.start_time) AS started,
                        (e.end_time IS NOT NULL AND NOW() > e.end_time) AS ended
-                  FROM Events e
-                  LEFT JOIN Venues v ON e.venue_id = v.venue_id
-                  LEFT JOIN Users u ON e.organizer_id = u.user_id
+                  FROM events e
+                  LEFT JOIN venues v ON e.venue_id = v.venue_id
+                  LEFT JOIN users u ON e.organizer_id = u.user_id
                  WHERE e.event_id = %s
                 """,
                 (user['user_id'], event_id),
@@ -764,8 +826,8 @@ def get_event_detail(event_id):
 
             cur.execute(
                 "SELECT c.category_id, c.category_name "
-                "  FROM Event_Categories ec "
-                "  JOIN Categories c ON ec.category_id = c.category_id "
+                "  FROM event_categories ec "
+                "  JOIN categories c ON ec.category_id = c.category_id "
                 " WHERE ec.event_id = %s ORDER BY c.category_id ASC",
                 (event_id,),
             )
@@ -840,16 +902,16 @@ def get_user_registrations(user_id):
             e.end_time,
             v.venue_name,
             v.location
-        FROM Registrations r
-        JOIN Events e ON r.event_id = e.event_id
-        LEFT JOIN Venues v ON e.venue_id = v.venue_id
+        FROM registrations r
+        JOIN events e ON r.event_id = e.event_id
+        LEFT JOIN venues v ON e.venue_id = v.venue_id
         WHERE r.student_id = %s
         ORDER BY r.registered_at DESC
     """
     try:
         with db_cursor() as cur:
             cur.execute(
-                "SELECT COUNT(*) AS total FROM Registrations WHERE student_id = %s",
+                "SELECT COUNT(*) AS total FROM registrations WHERE student_id = %s",
                 (user_id,),
             )
             total = cur.fetchone()['total']
@@ -866,7 +928,9 @@ def get_user_registrations(user_id):
 # 组织者发布活动
 @app.route('/api/create_event', methods=['POST'])
 def create_event():
-    user = require_role('organizer')
+    user = require_user()
+    if user['role'] not in ('organizer', 'admin'):
+        raise AppError("只有组织者可以发布活动", code=403, http_status=403)
 
     data = request.get_json(silent=True) or {}
     try:
@@ -874,7 +938,7 @@ def create_event():
             fields = _validated_event_fields(cur, data)
             cur.execute(
                 """
-                INSERT INTO Events
+                INSERT INTO events
                     (title, description, organizer_id, venue_id, start_time, end_time, capacity, status)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
                 """,
@@ -899,21 +963,40 @@ def update_event(event_id):
         with db_cursor(commit=True) as cur:
             _require_event_owner(cur, event_id, user, "无权编辑他人发布的活动")
 
-            # 已开始的活动不改开始时间时，不再要求「开始时间在未来」
+            # 先锁活动行：让后续名额校验读到最新数据，并与并发报名串行化
+            _lock_event(cur, event_id)
             cur.execute(
-                "SELECT (NOW() > start_time) AS started FROM Events WHERE event_id = %s",
+                "SELECT venue_id, start_time, end_time, "
+                "(NOW() > start_time) AS started FROM events WHERE event_id = %s",
                 (event_id,),
             )
-            started = bool(cur.fetchone()['started'])
-            fields = _validated_event_fields(cur, data, require_future=not started, exclude_event_id=event_id)
+            current = cur.fetchone()
+            started = bool(current['started'])
 
-            active = _count_active_registrations(cur, event_id)
+            # 已开始的活动不允许改开始时间，否则可以靠「把开始时间改到未来」
+            # 重新开放报名/签到，并绕过「已开始不能删除/重新开放」的保护。
+            if started and data.get('start_time'):
+                new_start = _validate_datetime(data['start_time'], '开始时间')
+                if new_start != _fmt_dt(current['start_time']):
+                    raise AppError("活动已开始，不能修改开始时间")
+
+            # 已开始的活动不改开始时间时，不再要求「开始时间在未来」
+            fields = _validated_event_fields(cur, data, require_future=not started,
+                                            exclude_event_id=event_id, current=current)
+
+            # 锁定读：避免用事务旧快照判容量，缩小名额时造成超卖
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM registrations "
+                "WHERE event_id = %s AND status <> 'cancelled' FOR UPDATE",
+                (event_id,),
+            )
+            active = cur.fetchone()['cnt']
             if fields['capacity'] < active:
                 raise AppError(f"名额不能小于当前已报名人数（{active}）")
 
             cur.execute(
                 """
-                UPDATE Events
+                UPDATE events
                    SET title = %s, description = %s, venue_id = %s,
                        start_time = %s, end_time = %s, capacity = %s
                  WHERE event_id = %s
@@ -940,9 +1023,10 @@ def cancel_registration(registration_id):
             cur.execute(
                 """
                 SELECT r.status, r.student_id, e.organizer_id, (NOW() > e.start_time) AS started
-                FROM Registrations r
-                JOIN Events e ON r.event_id = e.event_id
+                FROM registrations r
+                JOIN events e ON r.event_id = e.event_id
                 WHERE r.registration_id = %s
+                FOR UPDATE
                 """,
                 (registration_id,),
             )
@@ -966,11 +1050,13 @@ def cancel_registration(registration_id):
                 raise AppError("活动已开始，不能取消报名")
 
             cur.execute(
-                "UPDATE Registrations SET status = 'cancelled', "
+                "UPDATE registrations SET status = 'cancelled', "
                 "cancelled_at = NOW(), cancelled_by = %s "
-                "WHERE registration_id = %s",
+                "WHERE registration_id = %s AND status = 'registered'",
                 (user['user_id'], registration_id),
             )
+            if cur.rowcount != 1:
+                raise AppError("该报名状态已变化，请刷新后重试", code=409, http_status=409)
         return ok("取消报名成功")
     except mysql.connector.Error:
         app.logger.exception("取消报名失败")
@@ -985,13 +1071,15 @@ def delete_event(event_id):
     try:
         with db_cursor(commit=True) as cur:
             _require_event_owner(cur, event_id, user, "无权删除他人发布的活动")
+            # 与 register_event 保持相同加锁顺序（先 events 再 registrations），避免死锁
+            _lock_event(cur, event_id)
 
-             # 已签到 / 已开始的活动不允许普通组织者删除，防止抹掉考勤凭据
+            # 已签到 / 已开始的活动不允许普通组织者删除，防止抹掉考勤凭据
             cur.execute(
                 "SELECT (NOW() > start_time) AS started, "
-                "       (SELECT COUNT(*) FROM Registrations "
+                "       (SELECT COUNT(*) FROM registrations "
                 "         WHERE event_id = %s AND status = 'checked_in') AS checked "
-                "  FROM Events WHERE event_id = %s",
+                "  FROM events WHERE event_id = %s",
                 (event_id, event_id),
             )
             state = cur.fetchone()
@@ -1001,10 +1089,10 @@ def delete_event(event_id):
                 raise AppError("活动已开始，不能删除", code=409, http_status=409)
             
             # 兼容旧版未加级联的库：先显式清理关联数据，再删除活动
-            cur.execute("DELETE FROM Comments WHERE event_id = %s", (event_id,))
-            cur.execute("DELETE FROM Event_Categories WHERE event_id = %s", (event_id,))
-            cur.execute("DELETE FROM Registrations WHERE event_id = %s", (event_id,))
-            cur.execute("DELETE FROM Events WHERE event_id = %s", (event_id,))
+            cur.execute("DELETE FROM comments WHERE event_id = %s", (event_id,))
+            cur.execute("DELETE FROM event_categories WHERE event_id = %s", (event_id,))
+            cur.execute("DELETE FROM registrations WHERE event_id = %s", (event_id,))
+            cur.execute("DELETE FROM events WHERE event_id = %s", (event_id,))
         return ok("活动已删除")
     except mysql.connector.Error:
         app.logger.exception("删除活动失败")
@@ -1018,6 +1106,9 @@ def close_event(event_id):
 
     data = request.get_json(silent=True) or {}
     action = (data.get('action') or 'close').strip().lower()
+    # 兼容前端可能传 'close' / 'closed' 两种写法，避免“关闭报名”按钮直接失效
+    if action == 'closed':
+        action = 'close'
     if action not in ('close', 'open'):
         raise AppError("无效的操作")
 
@@ -1031,7 +1122,7 @@ def close_event(event_id):
                 cur.execute(
                     "SELECT (NOW() > start_time) AS started, "
                     "(end_time IS NOT NULL AND NOW() > end_time) AS ended "
-                    "FROM Events WHERE event_id = %s",
+                    "FROM events WHERE event_id = %s",
                     (event_id,),
                 )
                 state = cur.fetchone()
@@ -1041,7 +1132,7 @@ def close_event(event_id):
                     raise AppError("活动已经开始，无法重新开放报名")
 
             cur.execute(
-                "UPDATE Events SET status = %s WHERE event_id = %s",
+                "UPDATE events SET status = %s WHERE event_id = %s",
                 (new_status, event_id),
             )
         return ok("活动已关闭报名" if action == 'close' else "活动已重新开放")
@@ -1060,9 +1151,10 @@ def remove_registration(registration_id):
             cur.execute(
                 """
                 SELECT r.status, e.organizer_id, (NOW() > e.start_time) AS started
-                FROM Registrations r
-                JOIN Events e ON r.event_id = e.event_id
+                FROM registrations r
+                JOIN events e ON r.event_id = e.event_id
                 WHERE r.registration_id = %s
+                FOR UPDATE
                 """,
                 (registration_id,),
             )
@@ -1082,11 +1174,13 @@ def remove_registration(registration_id):
                 raise AppError("活动已开始，不能移出学生")
 
             cur.execute(
-                "UPDATE Registrations SET status = 'cancelled', "
+                "UPDATE registrations SET status = 'cancelled', "
                 "cancelled_at = NOW(), cancelled_by = %s "
-                "WHERE registration_id = %s",
+                "WHERE registration_id = %s AND status = 'registered'",
                 (user['user_id'], registration_id),
             )
+            if cur.rowcount != 1:
+                raise AppError("该报名状态已变化，请刷新后重试", code=409, http_status=409)
         return ok("已将该学生移出活动")
     except mysql.connector.Error:
         app.logger.exception("移除报名失败")
@@ -1101,7 +1195,7 @@ def get_venues():
     try:
         with db_cursor() as cur:
             cur.execute(
-                "SELECT venue_id, venue_name, location, capacity FROM Venues "
+                "SELECT venue_id, venue_name, location, capacity FROM venues "
                 "WHERE available_status = 1"
             )
             venues = cur.fetchall()
@@ -1120,7 +1214,7 @@ def get_categories():
         with db_cursor() as cur:
             cur.execute(
                 "SELECT category_id, category_name, description "
-                "FROM Categories ORDER BY category_id ASC"
+                "FROM categories ORDER BY category_id ASC"
             )
             categories = cur.fetchall()
     except mysql.connector.Error:
@@ -1141,9 +1235,10 @@ def check_in(registration_id):
                 SELECT r.status, e.organizer_id,
                        (NOW() < e.start_time) AS not_started,
                        (e.end_time IS NOT NULL AND NOW() > e.end_time) AS ended
-                FROM Registrations r
-                JOIN Events e ON r.event_id = e.event_id
+                FROM registrations r
+                JOIN events e ON r.event_id = e.event_id
                 WHERE r.registration_id = %s
+                FOR UPDATE
                 """,
                 (registration_id,),
             )
@@ -1163,10 +1258,12 @@ def check_in(registration_id):
                 raise AppError("活动已结束，无法签到")
 
             cur.execute(
-                "UPDATE Registrations SET status = 'checked_in', check_in_time = NOW() "
-                "WHERE registration_id = %s",
+                "UPDATE registrations SET status = 'checked_in', check_in_time = NOW() "
+                "WHERE registration_id = %s AND status = 'registered'",
                 (registration_id,),
             )
+            if cur.rowcount != 1:
+                raise AppError("该报名状态已变化，请刷新后重试", code=409, http_status=409)
         return ok("签到成功！")
     except mysql.connector.Error:
         app.logger.exception("签到失败")
@@ -1183,9 +1280,10 @@ def undo_check_in(registration_id):
             cur.execute(
                 """
                 SELECT r.status, e.organizer_id, (e.end_time IS NOT NULL AND NOW() > e.end_time) AS ended
-                FROM Registrations r
-                JOIN Events e ON r.event_id = e.event_id
+                FROM registrations r
+                JOIN events e ON r.event_id = e.event_id
                 WHERE r.registration_id = %s
+                FOR UPDATE
                 """,
                 (registration_id,),
             )
@@ -1202,10 +1300,12 @@ def undo_check_in(registration_id):
                 raise AppError("活动已结束，不能撤销签到")
 
             cur.execute(
-                "UPDATE Registrations SET status = 'registered', check_in_time = NULL "
-                "WHERE registration_id = %s",
+                "UPDATE registrations SET status = 'registered', check_in_time = NULL "
+                "WHERE registration_id = %s AND status = 'checked_in'",
                 (registration_id,),
             )
+            if cur.rowcount != 1:
+                raise AppError("该报名状态已变化，请刷新后重试", code=409, http_status=409)
         return ok("已撤销签到")
     except mysql.connector.Error:
         app.logger.exception("撤销签到失败")
@@ -1217,31 +1317,38 @@ def undo_check_in(registration_id):
 def get_event_registrations(event_id):
     user = require_user()
     page, page_size, offset = _pagination(DEFAULT_LIST_PAGE_SIZE)
+    # ?include_cancelled=1 时一并返回已取消的报名记录（含取消人/取消时间，便于审计）
+    include_cancelled = request.args.get('include_cancelled') in ('1', 'true', 'yes')
+    status_where = '' if include_cancelled else " AND r.status <> 'cancelled'"
 
     try:
         with db_cursor() as cur:
             _require_event_owner(cur, event_id, user, "无权查看该活动的报名名单")
 
             cur.execute(
-                "SELECT COUNT(*) AS total FROM Registrations "
-                "WHERE event_id = %s AND status <> 'cancelled'",
+                "SELECT COUNT(*) AS total FROM registrations r "
+                "WHERE r.event_id = %s" + status_where,
                 (event_id,),
             )
             total = cur.fetchone()['total']
 
             cur.execute(
-                """
+                f"""
                 SELECT
                     r.registration_id,
                     r.status AS registration_status,
                     r.registered_at,
                     r.check_in_time,
+                    r.cancelled_at,
+                    r.cancelled_by,
+                    cu.name AS cancelled_by_name,
                     u.user_id,
                     u.name AS student_name,
                     u.email AS student_email
-                FROM Registrations r
-                JOIN Users u ON r.student_id = u.user_id
-                WHERE r.event_id = %s AND r.status <> 'cancelled'
+                FROM registrations r
+                JOIN users u ON r.student_id = u.user_id
+                LEFT JOIN users cu ON r.cancelled_by = cu.user_id
+                WHERE r.event_id = %s{status_where}
                 ORDER BY r.registered_at ASC, r.registration_id ASC
                 LIMIT %s OFFSET %s
                 """,
@@ -1253,7 +1360,7 @@ def get_event_registrations(event_id):
         raise AppError("服务异常，请稍后重试", code=500, http_status=500)
 
     for r in registrations:
-        fmt_row(r, 'registered_at', 'check_in_time')
+        fmt_row(r, 'registered_at', 'check_in_time', 'cancelled_at')
     return ok(data=registrations, **_page_payload(page, page_size, total))
 
 
@@ -1265,12 +1372,12 @@ def get_comments(event_id):
 
     try:
         with db_cursor() as cur:
-            cur.execute("SELECT event_id FROM Events WHERE event_id = %s", (event_id,))
+            cur.execute("SELECT event_id FROM events WHERE event_id = %s", (event_id,))
             if not cur.fetchone():
                 raise AppError("活动不存在", code=404, http_status=404)
 
             cur.execute(
-                "SELECT COUNT(*) AS total FROM Comments WHERE event_id = %s",
+                "SELECT COUNT(*) AS total FROM comments WHERE event_id = %s",
                 (event_id,),
             )
             total = cur.fetchone()['total']
@@ -1284,8 +1391,8 @@ def get_comments(event_id):
                     u.user_id,
                     u.name AS user_name,
                     u.role AS user_role
-                FROM Comments c
-                JOIN Users u ON c.user_id = u.user_id
+                FROM comments c
+                JOIN users u ON c.user_id = u.user_id
                 WHERE c.event_id = %s
                 ORDER BY c.created_at DESC, c.comment_id DESC
                 LIMIT %s OFFSET %s
@@ -1314,14 +1421,30 @@ def post_comment():
         raise AppError("评论内容不能为空")
     if len(content) > 500:
         raise AppError("评论不能超过 500 字")
+    rate_limit(f'comment:{user["user_id"]}', COMMENT_RATE_LIMIT, "评论过于频繁")
 
     try:
         with db_cursor(commit=True) as cur:
-            cur.execute("SELECT event_id FROM Events WHERE event_id = %s", (event_id,))
-            if not cur.fetchone():
-                raise AppError("活动不存在", code=404, http_status=404)
             cur.execute(
-                "INSERT INTO Comments (event_id, user_id, content) VALUES (%s, %s, %s)",
+                "SELECT event_id, organizer_id FROM events WHERE event_id = %s",
+                (event_id,),
+            )
+            event = cur.fetchone()
+            if not event:
+                raise AppError("活动不存在", code=404, http_status=404)
+
+            # 评论 = 活动评价：只有报名过该活动的学生、活动组织者或管理员可以评论
+            if not is_admin(user) and user['user_id'] != event['organizer_id']:
+                cur.execute(
+                    "SELECT 1 FROM registrations "
+                    "WHERE event_id = %s AND student_id = %s AND status <> 'cancelled' LIMIT 1",
+                    (event_id, user['user_id']),
+                )
+                if not cur.fetchone():
+                    raise AppError("只有报名过该活动的同学才能评论", code=403, http_status=403)
+
+            cur.execute(
+                "INSERT INTO comments (event_id, user_id, content) VALUES (%s, %s, %s)",
                 (event_id, user['user_id'], content),
             )
         return ok("评论成功")
@@ -1340,8 +1463,8 @@ def delete_comment(comment_id):
             cur.execute(
                 """
                 SELECT c.user_id AS comment_author, e.organizer_id
-                FROM Comments c
-                JOIN Events e ON c.event_id = e.event_id
+                FROM comments c
+                JOIN events e ON c.event_id = e.event_id
                 WHERE c.comment_id = %s
                 """,
                 (comment_id,),
@@ -1352,7 +1475,7 @@ def delete_comment(comment_id):
             if not is_admin(user) and user['user_id'] not in (comment['comment_author'], comment['organizer_id']):
                 raise AppError("无权删除该评论", code=403, http_status=403)
 
-            cur.execute("DELETE FROM Comments WHERE comment_id = %s", (comment_id,))
+            cur.execute("DELETE FROM comments WHERE comment_id = %s", (comment_id,))
         return ok("评论已删除")
     except mysql.connector.Error:
         app.logger.exception("删除评论失败")
@@ -1366,6 +1489,61 @@ def me():
     return ok(data=user)
 
 
+# 退出登录：令牌立即失效（token_version + 1，所有设备上的旧令牌一起作废）
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    user = require_user()
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "UPDATE users SET token_version = token_version + 1 WHERE user_id = %s",
+                (user['user_id'],),
+            )
+    except mysql.connector.Error:
+        app.logger.exception("退出登录失败")
+        raise AppError("操作失败，请稍后重试", code=500, http_status=500)
+    return ok("已退出登录")
+
+
+# 修改密码：校验旧密码，成功后旧令牌全部失效并返回新令牌
+@app.route('/api/change_password', methods=['PUT'])
+def change_password():
+    user = require_user()
+    data = request.get_json(silent=True) or {}
+    old_password = data.get('old_password') or ''
+    new_password = data.get('new_password') or ''
+
+    if not old_password or not new_password:
+        raise AppError("旧密码和新密码不能为空")
+    password_ok, password_msg = validate_password(new_password)
+    if not password_ok:
+        raise AppError(password_msg)
+    if old_password == new_password:
+        raise AppError("新密码不能与旧密码相同")
+
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "SELECT password_hash, token_version FROM users WHERE user_id = %s FOR UPDATE",
+                (user['user_id'],),
+            )
+            row = cur.fetchone()
+            if not row or not bcrypt.checkpw(old_password.encode('utf-8'), row['password_hash'].encode('utf-8')):
+                raise AppError("旧密码不正确")
+
+            hashed = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            cur.execute(
+                "UPDATE users SET password_hash = %s, token_version = token_version + 1 "
+                "WHERE user_id = %s",
+                (hashed, user['user_id']),
+            )
+            new_version = int(row['token_version'] or 0) + 1
+        return ok("密码已修改，请使用新密码重新登录", token=issue_token(user['user_id'], new_version))
+    except mysql.connector.Error:
+        app.logger.exception("修改密码失败")
+        raise AppError("操作失败，请稍后重试", code=500, http_status=500)
+
+
 # 管理员：查看全部用户
 @app.route('/api/admin/users', methods=['GET'])
 def admin_list_users():
@@ -1374,12 +1552,12 @@ def admin_list_users():
 
     try:
         with db_cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS total FROM Users")
+            cur.execute("SELECT COUNT(*) AS total FROM users")
             total = cur.fetchone()['total']
             cur.execute(
                 """
                 SELECT user_id, name, email, role, created_at
-                FROM Users
+                FROM users
                 ORDER BY user_id ASC
                 LIMIT %s OFFSET %s
                 """,
