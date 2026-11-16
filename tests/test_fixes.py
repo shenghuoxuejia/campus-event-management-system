@@ -74,7 +74,7 @@ def test_remove_checked_in_student_fails(client, auth, active_scene):
 # ---------------- 管理员代操作 ----------------
 
 def _promote_to_admin(db, user_id):
-    db("UPDATE Users SET role = 'admin' WHERE user_id = %s", (user_id,))
+    db("UPDATE users SET role = 'admin' WHERE user_id = %s", (user_id,))
 
 
 def test_admin_can_check_in(client, auth, active_scene, db, make_user):
@@ -100,7 +100,7 @@ def test_admin_can_cancel_registration(client, auth, registration, db, make_user
 def test_cannot_book_disabled_venue(client, auth, event, db):
     venues = client.get('/api/venues', headers=auth(event['org_token'])).get_json()['data']
     venue_id = venues[-1]['venue_id']
-    db("UPDATE Venues SET available_status = 0 WHERE venue_id = %s", (venue_id,))
+    db("UPDATE venues SET available_status = 0 WHERE venue_id = %s", (venue_id,))
     try:
         resp = client.post('/api/create_event', headers=auth(event['org_token']), json={
             'title': '停用场地活动', 'description': '',
@@ -111,7 +111,7 @@ def test_cannot_book_disabled_venue(client, auth, event, db):
         assert resp.status_code == 400
         assert '停用' in resp.get_json()['message']
     finally:
-        db("UPDATE Venues SET available_status = 1 WHERE venue_id = %s", (venue_id,))
+        db("UPDATE venues SET available_status = 1 WHERE venue_id = %s", (venue_id,))
 
 
 def test_create_event_rejects_invalid_time_format(client, auth, event):
@@ -165,7 +165,7 @@ def test_cannot_remove_after_start(client, auth, active_scene):
 def test_cannot_undo_check_in_after_end(client, auth, ended_scene, db):
     """活动结束后，组织者不能撤销签到。"""
     # 先把报名改成已签到（绕过 check_in 的“已结束不能签到”限制）
-    db("UPDATE Registrations SET status = 'checked_in', check_in_time = NOW() "
+    db("UPDATE registrations SET status = 'checked_in', check_in_time = NOW() "
        "WHERE registration_id = %s", (ended_scene['registration_id'],))
     resp = client.put(f"/api/undo_check_in/{ended_scene['registration_id']}",
                       headers=auth(ended_scene['org_token']))
@@ -208,7 +208,7 @@ def test_cancel_records_cancelled_at_and_by(client, auth, event, registration, d
     # 直接查库确认字段已写入
     with app_module.db_cursor() as cur:
         cur.execute(
-            "SELECT status, cancelled_at, cancelled_by FROM Registrations "
+            "SELECT status, cancelled_at, cancelled_by FROM registrations "
             "WHERE registration_id = %s",
             (rid,),
         )
@@ -232,7 +232,7 @@ def test_re_register_clears_cancel_fields(client, auth, event, registration):
     with app_module.db_cursor() as cur:
         cur.execute(
             "SELECT status, cancelled_at, cancelled_by, check_in_time "
-            "FROM Registrations WHERE registration_id = %s",
+            "FROM registrations WHERE registration_id = %s",
             (rid,),
         )
         row = cur.fetchone()

@@ -113,8 +113,8 @@ def test_events_pagination_meta(client, auth, event):
     assert result['pages'] == (result['total'] + 1) // 2
 
 
-def test_comments_pagination_meta(client, auth, event, make_user):
-    _, stu_token = make_user('student')
+def test_comments_pagination_meta(client, auth, event, registration):
+    stu_token = registration['stu_token']
     for i in range(3):
         client.post('/api/comments', headers=auth(stu_token), json={
             'event_id': event['event_id'], 'content': f'评论{i}',

@@ -1,23 +1,13 @@
 """报名接口测试，含并发防超卖。"""
 import threading
-import time
 import uuid
-from datetime import datetime, timedelta
 
 
 def _headers(token):
     return {'Authorization': f'Bearer {token}'}
 
 
-def _unique_window():
-    """生成一对唯一的 (start, end)，纳秒时间戳 + uuid 双保险，几乎不会撞。"""
-    seed = (time.time_ns() ^ uuid.uuid4().int) % (30 * 365 * 24 * 3600)
-    base = datetime(2030, 1, 1) + timedelta(seconds=seed)
-    return (base.strftime('%Y-%m-%dT%H:%M:%S'),
-            (base + timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S'))
-
-
-def test_no_oversell(app, client, make_user):
+def test_no_oversell(app, client, make_user, unique_event_window):
     _, org_token = make_user('organizer')
     _, tok_a = make_user('student')
     _, tok_b = make_user('student')
@@ -26,9 +16,10 @@ def test_no_oversell(app, client, make_user):
     assert venues.status_code == 200
     venue_id = venues.get_json()['data'][0]['venue_id']
 
-    # 标题使用唯一值，避免与历史测试遗留的同名活动混淆
+    # 标题使用唯一值，避免与其它活动混淆
     title = f'并发测试活动_{uuid.uuid4().hex[:8]}'
-    start, end = _unique_window()
+    # 时间窗由 conftest 单调分配，互不重叠，不会撞上「场地时间冲突」校验
+    start, end = unique_event_window()
     resp = client.post('/api/create_event', headers=_headers(org_token), json={
         'title': title,
         'description': '容量 1',

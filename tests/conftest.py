@@ -6,8 +6,9 @@
 3. 已安装 pytest：pip install -r requirements-dev.txt。
 """
 
+import itertools
+import os
 import sys
-import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -25,8 +26,6 @@ except ImportError:
 
 import app as app_module
 
-import os
-
 TEST_DB_NAME = os.environ.get('TEST_DB_NAME', 'campus_events_test')
 DEV_DB_NAME = os.environ.get('DB_NAME', 'campus_events')
 if TEST_DB_NAME == DEV_DB_NAME:
@@ -36,20 +35,40 @@ if TEST_DB_NAME == DEV_DB_NAME:
 # 在任何请求触发连接池之前，把 app 的库切到测试库
 app_module.db_config['database'] = TEST_DB_NAME
 
+# 会话内单调递增的时间窗分配器：相邻窗口间隔 4 小时、互不重叠，
+# 避免「场地时间冲突」校验把随机时间窗撞成偶发失败。
+_window_counter = itertools.count()
+
+
 def unique_window():
-    """生成一对唯一的 (start, end)，纳秒时间戳 + uuid 双保险，几乎不会撞。"""
-    seed = (time.time_ns() ^ uuid.uuid4().int) % (30 * 365 * 24 * 3600)
-    base = datetime(2030, 1, 1) + timedelta(seconds=seed)
+    """生成一对互不重叠的 (start, end)（2033-01-01 起，每次往后推 4 小时）。"""
+    idx = next(_window_counter)
+    base = datetime(2033, 1, 1) + timedelta(hours=4 * idx)
     return (base.strftime('%Y-%m-%dT%H:%M:%S'),
             (base + timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S'))
 
 
+def _wipe_test_data():
+    """清空测试库的业务数据（保留 venues / categories 种子数据）。
+
+    否则每跑一次就多几十个活动与用户，累计后会撞上场地冲突造成偶发失败。
+    """
+    tables = ('comments', 'event_categories', 'registrations', 'events', 'users')
+    with app_module.db_cursor(commit=True) as cur:
+        cur.execute('SET FOREIGN_KEY_CHECKS = 0')
+        try:
+            for table in tables:
+                cur.execute(f'DELETE FROM `{table}`')
+        finally:
+            cur.execute('SET FOREIGN_KEY_CHECKS = 1')
+
+
 @pytest.fixture(scope='session', autouse=True)
 def _ensure_test_db():
-    """第一个测试前检查测试库已初始化；未初始化直接退出并提示命令。"""
+    """第一个测试前检查测试库已初始化并清空历史数据，结束时再清一次。"""
     try:
         with app_module.db_cursor() as cur:
-            cur.execute("SELECT 1 FROM Users LIMIT 1")
+            cur.execute("SELECT 1 FROM users LIMIT 1")
             cur.fetchone()  # 必须消费结果，否则连接池报 Unread result found
     except Exception as e:
         pytest.exit(
@@ -60,6 +79,16 @@ def _ensure_test_db():
             f'然后重新运行 pytest。',
             returncode=1,
         )
+
+    _wipe_test_data()
+    yield
+    _wipe_test_data()
+
+
+@pytest.fixture()
+def unique_event_window():
+    """把时间窗分配器暴露给需要自己建活动的用例（例如并发防超卖）。"""
+    return unique_window
 
 
 @pytest.fixture()
@@ -116,6 +145,16 @@ def db():
 
 
 @pytest.fixture()
+def db_fetch():
+    """执行查询并返回所有行（用例里做断言用）。"""
+    def _query(sql, params=()):
+        with app_module.db_cursor(commit=True) as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    return _query
+
+
+@pytest.fixture()
 def event(client, make_user, auth):
     """创建组织者 + 一个活动，返回 dict(organizer, org_token, event_id)。"""
     org_user, org_token = make_user('organizer')
@@ -166,7 +205,7 @@ def active_scene(client, make_user, auth, event, db):
     registration_id = resp.get_json()['data']['registration_id']
 
     db(
-        "UPDATE Events SET start_time = NOW() - INTERVAL 1 HOUR, "
+        "UPDATE events SET start_time = NOW() - INTERVAL 1 HOUR, "
         "end_time = NOW() + INTERVAL 1 HOUR WHERE event_id = %s",
         (event['event_id'],),
     )
@@ -184,7 +223,7 @@ def ended_scene(client, make_user, auth, event, db):
     registration_id = resp.get_json()['data']['registration_id']
 
     db(
-        "UPDATE Events SET start_time = NOW() - INTERVAL 3 HOUR, "
+        "UPDATE events SET start_time = NOW() - INTERVAL 3 HOUR, "
         "end_time = NOW() - INTERVAL 1 HOUR WHERE event_id = %s",
         (event['event_id'],),
     )
