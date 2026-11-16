@@ -12,12 +12,19 @@ import secrets
 import sys
 from pathlib import Path
 
-ENV_PATH = Path(__file__).resolve().parent / '.env'
+ENV_PATH = Path(__file__).resolve().parent.parent / '.env'   # 项目根目录/.env
 
 
 def ask(prompt, default):
     value = input(f'{prompt} [{default}]: ').strip()
     return value or default
+
+
+def env_value(value):
+    """把值安全写入 .env（含 #、空格、引号等特殊字符时用双引号包裹）。"""
+    if value and any(ch in value for ch in '# "\\=\n\r'):
+        return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return value
 
 
 def main():
@@ -46,12 +53,16 @@ def main():
         f'DB_HOST={host}',
         f'DB_PORT={port}',
         f'DB_USER={user}',
-        f'DB_PASSWORD={password}',
+        f'DB_PASSWORD={env_value(password)}',
         f'DB_NAME={dbname}',
         '',
         '# 登录令牌签名密钥（已随机生成）',
         f'APP_SECRET_KEY={secrets.token_urlsafe(48)}',
         'TOKEN_MAX_AGE=86400',
+        '',
+        '# 登录 / 注册限流（次数/窗口秒数）',
+        'LOGIN_RATE_LIMIT=10/60',
+        'REGISTER_RATE_LIMIT=20/3600',
         '',
         'FLASK_DEBUG=0',
         f'PORT={app_port}',

@@ -1,6 +1,6 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 echo ============================================
 echo   校园活动报名与管理系统 - 首次安装
 echo ============================================
@@ -50,12 +50,12 @@ if exist ".env" (
     echo [3/4] .env 已存在，跳过数据库配置。
 ) else (
     echo [3/4] 配置数据库连接...
-    ".venv\Scripts\python.exe" setup_env.py
+    ".venv\Scripts\python.exe" backend\setup_env.py
 )
 
 rem ---- 5) 初始化数据库 ----
 echo [4/4] 检查并初始化数据库...
-".venv\Scripts\python.exe" init_db.py
+".venv\Scripts\python.exe" backend\init_db.py
 if errorlevel 1 (
     echo [错误] 数据库初始化失败，请按上面的提示处理后重试。
     pause
@@ -64,5 +64,5 @@ if errorlevel 1 (
 
 echo.
 echo 安装完成，正在启动...
-call "%~dp0启动校园活动系统.bat"
+call "%~dp0..\scripts\启动校园活动系统.bat"
 exit /b 0
