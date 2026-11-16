@@ -6,8 +6,8 @@
 
 | 项 | 地址 |
 | --- | --- |
-| 在线代码仓库（Gitee） | <https://gitee.com/hanjingyao/campus-event-project> |
-| 克隆命令 | `git clone https://gitee.com/hanjingyao/campus-event-project.git` |
+| 在线代码仓库（GitHub） | <https://github.com/shenghuoxuejia/campus-event-management-system> |
+| 克隆命令 | `git clone https://github.com/shenghuoxuejia/campus-event-management-system.git` |
 
 ## 目录
 
