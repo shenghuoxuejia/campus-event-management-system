@@ -1,0 +1,528 @@
+================================================================================
+校园活动报名与管理系统（CampusEventProject-fixed）
+课程大作业 —— 问题清单 / 待改进项
+================================================================================
+审查时间：见文件修改时间
+审查范围：backend/ frontend/ database/ tests/ scripts/ docs/ README.md .env .git
+审查方式：通读全部源码与文档 + 运行测试 + 检查 git 仓库状态 + 数据库/文档一致性核对
+测试现状：pytest tests/  →  76 passed（全部通过，说明下列问题都不是"测试能发现的"那类）
+总体结论：
+    代码质量与安全基线（令牌认证、参数化 SQL、密码哈希、行锁防超卖、统一响应）
+    明显高于一般课程作业，属于"能跑、能用、有测试"的水平。
+    扣分点不在"能不能跑"，而集中在：
+      1) 交付物不规范（未提交、.env 明文口令随包、缓存目录混入）；
+      2) 文档与实现不一致（表数量、级联删除、建库命令、ER 图缺表）；
+      3) 业务闭环不完整（场地冲突、删除活动抹除考勤、状态历史丢失、无通知/导出）；
+      4) 前端若干真实 bug（进行中活动显示"已结束"、Safari 时间解析、管理员列表截断）；
+      5) 工程化不足（1300 行单文件、无 CI、测试污染开发库、无覆盖率）。
+
+严重程度说明：
+    [P0] 必须修：影响安全、交付有效性，或现场演示必然翻车
+    [P1] 应当修：功能/文档明显缺口，答辩容易被追问
+    [P2] 建议修：体验、可维护性、加分项
+
+--------------------------------------------------------------------------------
+一、[P0] 交付与安全（最高优先级）
+--------------------------------------------------------------------------------
+P0-1  git 仓库里只有 1 个 commit，本次"修复版"的全部改动都还没提交
+      证据：`git log --oneline` 仅 96512bb "refactor: standardize project
+            directory structure"；`git status` 显示 README/app.py/index.html/
+            login.html/profile.html/schema.sql/init_db.py/setup_env.py/三个 .bat
+            全部为 " M" 已修改未提交；backend/make_admin.py、docs/、tests/、
+            requirements-dev.txt 为 "??" 未跟踪。
+      影响：老师若从 Gitee（origin 已配置为 gitee.com/hanjingyao/...）拉取代码，
+            拿到的是**旧版本**，看不到 76 个测试、make_admin、ER 图、分类功能、
+            签到撤销等所有亮点。这是最致命的交付问题。
+      建议：提交并 push；commit message 按功能拆分（认证/并发/分类/测试/文档），
+            保留清晰开发轨迹。
+
+P0-2  仓库工作区残留旧版垃圾文件（已跟踪但被删除/为空）
+      `git status` 中仍能看到 .gitignore.txt（0 字节）、frontend/database/schema.sql
+      （旧版重复的建表脚本）、一些说明.txt、现有功能说明.txt（0 字节）、
+      屏幕截图 2026-09-17 145018.png。
+      影响：交付物里出现两份 schema.sql、空文件、临时截图，显得不严谨。
+      建议：git rm 掉，提交时清理干净。
+
+P0-3  真实数据库口令与令牌签名密钥以明文 .env 留在项目目录
+      证据：项目根目录存在 .env，内含真实 DB_PASSWORD 与 APP_SECRET_KEY。
+      `.gitignore` 已忽略 .env（未被 git 跟踪，这点做对了），但**压缩包/网盘/
+      U 盘提交时 .env 会一起交出去**，密码与密钥即泄露；且密钥泄露 = 任何人都能
+      伪造任意用户的登录令牌（系统身份认证的基础被绕过）。
+      建议：交付/截图/打包前删除 .env（只保留 .env.example）；若已外发过，
+            立即改 MySQL 密码并重新生成 APP_SECRET_KEY。
+
+P0-4  限流可被 X-Forwarded-For 头直接绕过（真实漏洞）
+      位置：backend/app.py:283-289 `_client_ip()`
+      代码：forwarded = request.headers.get('X-Forwarded-For') → 直接 split 取首个
+      影响：应用直接对外监听时，攻击者为每个请求伪造一个不同的 XFF，即可让
+            "IP + 邮箱" 的限流 key 每次不同 → 登录爆破（默认 10 次/60 秒）、
+            注册刷号（20 次/小时）的限制形同虚设。
+      建议：默认只信 request.remote_addr；只有在部署了反向代理时才启用 XFF，
+            并把可信代理地址写入配置（如 TRUSTED_PROXIES）后校验来源；
+            另外限流维度应同时含"账号"，防分布式撞库。
+
+P0-5  无服务端登出 / 令牌无法吊销
+      位置：登录 issue_token（app.py:141）只签 uid，无版本号；前端 logout 仅清
+            localStorage。令牌默认 24 小时（TOKEN_MAX_AGE）。
+      影响：令牌一旦泄露（XSS、共享电脑、抓包）在 24 小时内无法作废；
+            改密码也无效（因为根本没有改密码功能）。
+      建议：用户表加 token_version，签发时带上，校验时比对；登出/改密时自增，
+            旧令牌立即失效。或改用短时 access + refresh。
+
+P0-6  README 的建库命令根本无法执行（文档错误，验收第一步就失败）
+      位置：README.md:112 `mysql -u root -p < database/schema.sql`
+      证据：database/schema.sql 内**没有** CREATE DATABASE、也没有 USE 语句
+            （实测：'CREATE DATABASE' in schema → False，'USE ' → False），
+            该文件是 mysqldump 导出、默认认为"已选定库"。
+      影响：执行必然报 ERROR 1046 (3D000): No database selected，
+            按 README 手动安装的同学第一步就卡住，只能改用 init_db.py。
+      建议：在 schema.sql 顶部补
+              CREATE DATABASE IF NOT EXISTS campus_events
+                DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              USE campus_events;
+            或把 README 改成 `mysql -u root -p campus_events < database/schema.sql`
+            并注明需先手动建库。
+
+--------------------------------------------------------------------------------
+二、[P1] 文档与实现不一致（答辩高危，老师最容易挑）
+--------------------------------------------------------------------------------
+P1-1  "共 7 张业务表"是错的，实际 7 张，且 ER 图漏了 Comments
+      位置：README.md:45 及其后的表格；docs/er-diagram.png
+      证据：schema.sql 里实际有 7 张表（categories / comments / event_categories /
+            events / registrations / users / venues），但 README 表清单与 ER 图中
+            只有 6 张，comments（评论）完全缺失；ER 图上 Users 也只有一条
+            "1 报名 N"和"1 创建 N"，没有"1 发表 N 评论"关系。
+      影响：README 声称"评论"是核心功能之一（发布→报名→签到→评论），
+            ER 图却没有这张表 —— 数据库设计章节自相矛盾，必被追问。
+      建议：ER 图补 Comments 表及两条外键（event_id、user_id），
+            README 表数量改 7 并补 comments 一行（索引 idx_event、级联删除）。
+
+P1-2  README 声称"删除活动时级联清理报名"，数据库层其实没有级联
+      位置：README.md:63；schema.sql:116-117
+      证据：registrations 的两个外键都没有 ON DELETE CASCADE
+            （comments、event_categories 有，registrations 没有），
+            真正起作用的是 app.py:883 delete_event() 里手写的 4 条 DELETE。
+      影响：文档说 A、实现是 B；一旦有人直接删库或新增关联表忘记手写 DELETE，
+            就会出现外键错误/脏数据。
+      建议：统一到 DB 层（给 registrations 加 ON DELETE CASCADE），
+            或把 README 改成"应用层显式清理"，二者取一。
+
+P1-3  schema.sql 是 mysqldump 原样导出，含大量环境噪声
+      位置：database/schema.sql:1-18、96、120、130、154
+      证据：文件头 "MySQL dump ... Host: 127.0.0.1 Database: campus_events"、
+            `SET TIME_ZONE='+00:00'`、`/*!40101 SET ...*/`、AUTO_INCREMENT=6/8/9、
+            末尾 "Dump completed on 2026-09-26 21:26:02"。
+      影响：作为"数据库设计文档/建表脚本"提交不够专业；AUTO_INCREMENT 值会让
+            每次初始化后的 ID 不一致（测试/截图对不上）。
+      建议：重写为干净的 DDL（CREATE DATABASE + USE + 7 张 CREATE TABLE +
+            带注释字段 + 种子 INSERT），去掉 dump 包装与自增起始值；
+            字段加 COMMENT 后可与数据字典一一对应。
+
+P1-4  技术栈里写了 Postman / MySQL Workbench，但没有对应的可交付物
+      位置：README.md 技术栈表格
+      影响：老师若问"接口怎么测的"，只有 pytest 与手工 curl，没有集合文件。
+      建议：导出 Postman/Apifox 集合放 docs/ 或补一个 OpenAPI(swagger) 文件。
+
+P1-5  文档缺少课程大作业的"标准交付件"
+      现有 docs/ 只有 er-diagram.png 一张图。通常还应包含（缺一即扣分）：
+        需求分析（用例图、角色与功能清单）、系统设计（分层架构图、关键时序图：
+        报名防超卖/签到/取消）、数据库设计说明（三范式、数据字典）、
+        测试报告（用例表 + 通过率 + 覆盖率）、部署手册、用户手册（分角色截图）、
+        项目分工与开发日志、答辩 PPT。
+      建议：ER 图 + 时序图 + 数据字典 + 一份测试报告（pytest 输出 + 覆盖率截图）
+            至少补齐这四样，性价比最高。
+
+P1-6  README 无任何界面截图
+      影响：评审/老师在仓库首页看不到成品长什么样，体验分损失。
+      建议：docs/screenshots/ 放登录页、活动大厅、详情弹窗（报名名单+评论）、
+            我的报名、用户管理 5 张图，README 内嵌。
+
+P1-7  .env.example 用中文占位符，照抄即可启动（但连不上库且密钥不安全）
+      位置：.env.example `DB_PASSWORD=在这里填你的 MySQL 密码`、
+            `APP_SECRET_KEY=在这里填一段随机长字符串`
+      影响：APP_SECRET_KEY 只判空（app.py:60），填占位符也能通过 → 所有人用同一个
+            可预测密钥签名令牌；DB 密码是占位符时报错信息（连接失败）也不提示根因。
+      建议：启动校验密钥长度 ≥32 且不等于示例值；DB 密码为空/占位符时打印
+            明确提示"请在 .env 中填写真实数据库密码"。
+
+--------------------------------------------------------------------------------
+三、[P1] 业务逻辑与功能缺口
+--------------------------------------------------------------------------------
+P1-8  同一场地可被时间重叠的两个活动占用（业务漏洞，最容易被追问）
+      位置：backend/app.py:446-492 `_validated_event_fields()`（create/update 共用）
+      现状：只校验场地存在、可用、名额 ≤ 场地容量、start<end、start>NOW()，
+            **完全没有检查该场地在该时间段是否已被别的活动占用**；DB 也无约束。
+      影响：组织者可以在同一时间把"图书馆报告厅"分配给两个活动，报名、签到、
+            场地管理全部失真。这是活动管理系统的核心业务规则。
+      建议：加校验（事务内 + 唯一性/排他锁，避免并发绕过）：
+              SELECT event_id FROM Events
+               WHERE venue_id=%s AND event_id<>%s
+                 AND start_time < %s AND end_time > %s
+               FOR UPDATE
+            有交集则报"该场地在该时间段已被占用"；同时给
+            events(venue_id, start_time, end_time) 建索引。
+            进阶：加 venue_booking 表 + 唯一约束/触发器。
+
+P1-9  删除活动会连带抹掉历史出勤凭据，且不限制"已开始/已签到"
+      位置：backend/app.py:883-900 delete_event()
+      现状：无条件 DELETE Comments / Event_Categories / Registrations / Events。
+      影响：组织者误点一次，签到记录、报名名单、评论永久消失，无法追溯；
+            管理员也没有"删除前确认影响面"的提示（前端只说"不可恢复"）。
+      建议：① 活动一旦有 checked_in 记录或已开始，禁止删除（返回 409）；
+            ② 或改软删除（events.deleted_at / is_deleted），列表过滤；
+            ③ 至少把删除动作写审计日志（who, when, 影响条数）。
+
+P1-10 报名状态历史被覆盖，无法审计
+      位置：backend/app.py:429-444 `_upsert_registration()`；schema.sql registrations
+      现状：取消后重新报名是 UPDATE 同一行并 `registered_at = NOW()`，
+            原来的报名时间被覆盖；`status` 一个 enum 同时表达
+            registered / cancelled / checked_in，没有 cancelled_at、
+            cancelled_by、取消原因，也没有 updated_at。
+      影响：无法回答"谁在什么时候取消了报名""这个学生是第几次报名"；
+            课程若考察"状态机 + 历史留痕"，这里失分。
+      建议：拆成 registrations(status) + attendance(check_in_time, checked_in_by)
+            + registration_log(registration_id, action, operator_id, created_at)；
+            或至少加 cancelled_at / cancelled_by / updated_at 三个字段。
+
+P1-11 取消/移出/撤销签到没有时间窗限制（可篡改考勤）
+      位置：app.py:842 cancel_registration（无时间判断）、
+            app.py:942 remove_registration（活动进行中也能踢人）、
+            app.py:1059 undo_check_in（活动结束后仍可撤销签到）
+      影响：与 README 里"签到仅允许开始后~结束前"的规则不配套：
+            活动结束后组织者可以把已签到学生"撤销签到"，考勤结果可随意修改。
+      建议：undo_check_in 限制在活动结束前（或结束后 N 分钟内）；
+            cancel/remove 限制在活动开始前；否则只能由管理员带记录操作。
+
+P1-12 列表接口缺少分页/分页不一致
+      位置：app.py:738 `/api/user_registrations/<user_id>` 无分页（DEFAULT_LIST_PAGE_SIZE
+            只在报名名单/评论里用）；frontend/index.html:1122 管理员用户列表
+            固定 `page_size=100` 且忽略 pages。
+      影响：① "我的报名"随着历史增长一次返回全部；② 用户超过 100 人时，
+            后面的人在前端**静默消失**，管理员以为系统里没这个人。
+      建议：user_registrations 加分页；管理员列表加"加载更多/下一页"。
+
+P1-13 场地与分类是只读资源，没有任何管理入口
+      位置：只有 GET /api/venues、GET /api/categories
+      影响：新增场地/分类只能手工改数据库；管理员面板只有"用户列表"。
+            CRUD 不完整，答辩时"系统管理"模块偏薄。
+      建议：补 POST/PUT/DELETE /api/venues、/api/categories（仅管理员），
+            并在管理员面板做简单表格编辑。
+
+P1-14 管理员能力只有"看用户"
+      现状：升级管理员要命令行 make_admin.py；管理员不能改角色、不能禁用/删除
+            用户、不能查看所有活动、没有审计/统计面板。
+      影响：缺少真正的"后台管理"闭环；make_admin 依赖命令行也不适合演示。
+      建议：管理员面板补"角色调整 / 禁用账号 / 全部活动"，或至少补"活动总览 +
+            报名/签到统计"。
+
+P1-15 无活动详情接口，前端靠列表缓存
+      现状：没有 GET /api/events/<event_id>；openDetail() 从 eventsCache 取数据。
+      影响：① 详情不能通过 URL 分享/收藏，刷新丢失；② 列表与详情的报名名单/
+            评论数据不同步，别人刚报满，详情里看不到；③ REST 设计不完整。
+      建议：补详情接口（含 organizer 名称、分类、余量、是否已报名、是否已签到）。
+
+P1-16 无搜索 / 排序 / 状态筛选 / "我的活动"
+      现状：大厅只有分页 + 分类筛选；组织者无法只看"我发布的"；
+            学生无法只看"进行中/即将开始"。
+      影响：活动多了以后组织者只能翻页找自己的活动（还会被 loadEvents 重置到第 1 页）。
+      建议：/api/events 支持 keyword、status、mine=1、sort；前端加搜索框和
+            "我发布的/我报名的"页签。
+
+P1-17 通知、候补、导出、自助签到等"完整闭环"功能缺失
+      现状：无站内通知/提醒（活动变更、取消、临近开始）；无名额候补队列；
+            无名单导出（CSV/Excel）；无二维码/学生自助签到（全靠组织者手点）；
+            无活动评分/反馈；无活动海报上传。
+      影响：与"完整业务闭环"的宣传有落差，功能深度不足以支撑高分。
+      建议：优先做"活动取消时通知已报名学生"（哪怕只在页面顶部展示变更提示）
+            与"报名名单导出 CSV"（十几行代码，加分明显）。
+
+P1-18 评论不受任何约束
+      位置：app.py:1184 post_comment
+      现状：任意登录用户都能给任意活动评论（包括没报名、活动已结束），
+            无频率限制、无敏感词/审核、无举报，也无"仅参与者可评价"。
+      影响：与"评论=活动反馈"的产品定位不符。
+      建议：限制"仅报名过该活动的学生可评论"或单独做"评价（需签到后）"，
+            并给评论接口加简单限流。
+
+P1-19 无密码找回 / 修改密码 / 资料编辑
+      影响：账号密码泄露无法自救；邮箱写错只能重新注册；教师演示"改密码"无处可点。
+      建议：至少补 PUT /api/me（改名）与 PUT /api/change_password（校验旧密码）。
+
+P1-20 首次运行没有任何演示数据
+      现状：seed 只有 4 个分类 + 5 个场地；活动大厅是空的，管理员还要命令行生成。
+      影响：老师拿到项目后第一次运行看到"暂无活动"，演示还得现场注册造数据。
+      建议：加 backend/seed_demo.py（1 个 admin、2 个组织者、3 个学生、5 个
+            不同状态的示范活动 + 报名/签到/评论），README 一句话说明。
+
+P1-21 测试直连开发库，没有独立测试库，跑一次脏一次
+      位置：tests/conftest.py（db fixture 直接 commit），全部用例在 .env 指向的
+            campus_events 上跑；make_user 每用例随机注册真实用户，无清理。
+      证据：本次运行 76 个用例通过后，库里多出一批 *_@test.com 用户与测试活动。
+      影响：① 开发/演示数据被污染；② 换机器必须改 .env；③ 不能并行、不能 CI。
+      建议：TEST_DB_NAME=campus_events_test + 每个测试外层事务回滚，或
+            fixtures 里 teardown 清理；或 docker-compose 起独立 MySQL。
+
+P1-22 无 CI、无覆盖率、无 lint
+      现状：无 .github/workflows（远端在 Gitee，也没看到流水线）、无 pytest-cov
+            配置、requirements-dev.txt 只有 pytest。
+      影响：README 宣称"pytest 覆盖认证、边界、并发、签到…"，但没有任何覆盖率
+            数字；评审无法一键复现。
+      建议：加 pytest-cov 出报告（哪怕 60% 也写进 docs/测试报告），
+            加 ruff/flake8 + black 配置；Gitee 可配 Go 流水线或至少给
+            `scripts/run_tests.bat`。
+
+P1-23 测试覆盖有缺口，且并发用例偏弱
+      缺口：未覆盖 401 的 /api/undo_check_in、/api/categories；
+            /api/events 分页边界与非法 category_id；DELETE /api/delete_event 的
+            级联清理与"删别人的活动"；DB 异常路径（5xx）；前端 0 测试。
+      并发：tests/test_register_event.py 只有 2 个线程、Flask test_client，
+            无法真实验证行锁、也测不出死锁/超时。
+      建议：并发用例改 20+ 线程 + 断言"无 500、余量=0、成功数=容量"；
+            补一个 Playwright 冒烟脚本（登录→发布→报名→签到）即可覆盖前端主链路。
+
+--------------------------------------------------------------------------------
+四、[P1] 前端真实 bug（现场演示容易踩）
+--------------------------------------------------------------------------------
+P1-24 活动"进行中"被显示为"已结束"（状态文案错误）
+      位置：frontend/index.html:626-634
+      代码：isOpen = event.status === 'open' && now < startTime;
+            statusText = isClosed ? '已关闭' : (isOpen ? '报名中' : '已结束');
+      影响：活动已开始但未结束时，徽章显示"已结束"、按钮显示"活动已结束"，
+            与后端"活动已经开始，无法报名"的语义也不一致 —— 演示过程中
+            只要时间跨过开始时间，界面就明显错。
+      建议：状态推导改为三态（报名中 / 进行中 / 已结束），按钮文案相应改
+            "活动进行中"；建议后端顺带返回 server_now 或计算好的 display_status。
+
+P1-25 Safari / iOS 上所有活动都显示"已结束"（时间解析 bug）
+      位置：frontend/index.html:626 `new Date(event.start_time)`
+      现状：后端返回 "2026-01-01 10:00:00"（空格分隔，非 ISO8601）。
+            Chrome/Firefox 宽容解析，Safari 返回 Invalid Date → now < startTime
+            恒为 false，所有卡片变"已结束"。
+      影响：换浏览器答辩即翻车（若用 Mac/iPhone 演示）。
+      建议：`new Date(String(s).replace(' ', 'T'))`，或后端统一输出 ISO
+            （2026-01-01T10:00:00）。
+
+P1-26 前端状态依赖本地时钟，与后端 DB NOW() 判定不一致
+      影响：前端说"可报名"，点下去后端说"活动已经开始"；客户端时区/时钟不准时
+            现象更明显（README 特意说明时间判断交给数据库，前端却自己算）。
+      建议：后端返回 started/ended/remaining 等派生字段，前端只渲染不判断。
+
+P1-27 管理员用户列表最多显示 100 人（静默截断）
+      位置：frontend/index.html:1122 `fetch('/api/admin/users?page_size=100')`
+      影响：见 P1-12，用户规模一超就"少人"，且界面上没有任何提示。
+
+P1-28 请求期间无 loading/禁用，按钮可连点
+      影响：报名、签到、删除、取消可被连续点击多次（虽然后端会兜底报错），
+            但会弹出多条 toast、列表重复刷新，观感不好。
+      建议：统一 request 封装里给触发按钮加 disabled + 文案"提交中…"。
+
+P1-29 未登录时的兜底逻辑会抛 TypeError
+      位置：frontend/index.html:485-486、frontend/profile.html:252-253
+      代码：if (!userStr) { alert('请先登录！'); window.location.href='login.html'; }
+            const currentUser = JSON.parse(userStr);
+      影响：alert 不中断执行 → JSON.parse(null) 得 null → 下一行
+            currentUser.name 抛错（控制台报错；虽然页面会跳转）。
+      建议：改成 `if (!userStr) { location.replace('login.html'); throw ... }` 或
+            放进 else 分支。
+
+P1-30 每次操作后列表重置到第 1 页
+      位置：index.html loadEvents() 在报名/编辑/删除/签到/移出后都被调用（reset=true）
+      影响：组织者在第 3 页管理活动，删一个就跳回第 1 页，逐条处理很难受。
+      建议：操作后局部更新卡片或保留 eventPage 重新拉当前页。
+
+P1-31 三份前端页面各自复制同一套基础设施代码
+      现状：login/index/profile 三个 HTML 各自内联了 fetch 包装、escapeHtml、
+            toast、自定义 confirm（每份约 80-120 行），CSS 变量/配色也重复；
+            index.html 单文件 1179 行，HTML+CSS+JS 混排。
+      影响：改一处要改三处，容易不一致（例如三处 fetch 包装完全一样）。
+      建议：抽 frontend/static/common.js + common.css（Flask 已托管静态目录，
+            只需改 static_url_path 或放到 frontend/static/）。
+
+P1-32 表单体验与可访问性
+      现状：用 div+button+onclick 而非 <form> → 登录页按 Enter 不会提交；
+            输入框只有 placeholder 没有 <label>；无 autocomplete="username/
+            current-password"；无错误信息就地提示（只有居中 toast）。
+      建议：改成 form + submit 事件，补 label/aria，错误就近显示。
+
+P1-33 其它小问题
+      · 无 favicon.ico → 每次访问产生 404，而 404 handler（app.py:1283）对非 /api
+        路径返回 login.html（把 HTML 当图片返回），控制台一片红。
+      · `Cache-Control: no-store` 加在**所有**响应上（app.py:88，after_request），
+        静态 HTML/CSS/JS 也不缓存，刷新即重新下载。
+      · 无深链接：活动详情不能通过 URL 打开。
+      · 无移动端适配验证说明（grid 自适应有，但弹窗/表格在窄屏未验证）。
+      · 角色变更（make_admin）后前端 localStorage 的 user 仍是旧角色，
+        必须重新登录才能看到管理员面板。
+
+--------------------------------------------------------------------------------
+五、[P2] 后端代码质量与架构（编号 C-x，个别条目重要性接近 P1）
+--------------------------------------------------------------------------------
+C-1  backend/app.py 单文件 1303 行，路由/认证/校验/SQL/限流全在一起
+      影响：课程报告的"模块化设计"章节无内容可写；函数间耦合高；难并行开发。
+      建议：拆成 config.py / db.py / auth.py / errors.py / validators.py /
+            routes/{auth,events,registrations,comments,admin}.py（Blueprint）。
+
+C-2  20 处 `except mysql.connector.Error` 复制同一段模板
+      位置：几乎每个路由末尾（app.py: 各函数 except 分支）
+      影响：异常处理噪音占全文 1/4，且各处日志文案不一致（有的写"报名失败"，
+            有的写"操作失败，请稍后重试"）。
+      建议：用 @app.errorhandler(mysql.connector.Error) 统一兜底 + 各路由只处理
+            业务异常（AppError）。
+
+C-3  权限查询代码重复
+      现状：cancel_registration / remove_registration / check_in / undo_check_in /
+            delete_comment 各自手写一条 JOIN 查询 + 一段 if 判断谁能操作。
+      影响：权限规则分散在 5 处，新增角色或改规则容易漏改（例如"管理员"判断
+            在每处都要记得加 is_admin）。
+      建议：抽 `_load_registration_ctx(cur, rid)` + 统一 `can_manage_event(user, org_id)`
+            / `can_manage_registration(user, ctx)` 两个判定函数。
+
+C-4  HTTP 语义不严谨
+      · 重复报名/名额已满 → 400，应为 409 Conflict；
+      · 资源不存在与无权限有时都用 400/403/404 混用（建议"无权访问"一律 404）；
+      · 创建成功仍返回 code=200（建议 201）；
+      · cancel_registration / check_in / undo_check_in / close_event 都用 PUT 改状态，
+        语义不统一（close_event 甚至靠 body 里的 action 切换两种行为）。
+      影响：接口规范性扣分；也让 README 的"业务码=HTTP 码"说法显得随意。
+
+C-5  "统一响应结构"其实不统一
+      位置：app.py:250 `_page_payload()` + 各列表接口 `ok(data=..., **page)`
+      现状：分页元信息 total/page/page_size/pages 与 code/message/data 平铺在顶层，
+            README 也是这么写的，等于自破"所有接口返回 {code,message,data}"的约定。
+      建议：`{"code":200,"data":{"items":[...],"total":..,"page":..}}`。
+
+C-6  配置读取全在模块导入期
+      位置：app.py:57 `int(os.environ.get('TOKEN_MAX_AGE','86400'))`、
+            app.py:1303 `int(os.environ.get('PORT','5000'))`
+      影响：TOKEN_MAX_AGE/PORT/DB_PORT 写错（非数字）→ 启动直接抛
+            ValueError 栈，提示不友好；无法做单元测试级别的配置覆盖。
+      建议：集中 Config 类 + 校验 + 明确报错信息。
+
+C-7  连接池固定 5 连接，无健康检查/重连
+      位置：app.py:99-113
+      影响：MySQL 空闲超时（wait_timeout 默认 8h）或网络闪断后，池里可能是坏连接，
+            表现为偶发 500；pool_size 也无法通过环境变量调整。
+      建议：get_connection 后 `conn.ping(reconnect=True)`（或 try/except 重取一次），
+            pool_size 走配置；README 说明生产建议。
+
+C-8  死代码/冗余代码
+      · `fail()`（app.py:195）只在 errorhandler 里用；
+      · `_lock_event` 里 `end_time IS NOT NULL` 判断（列是 NOT NULL）；
+      · get_events 的 `ORDER BY (e.end_time IS NOT NULL AND e.end_time < NOW())`
+        同样含无效的 NULL 判断；
+      · 各 handler 里 `if not reg` 与 `_require_event_owner` 重复"不存在"处理。
+
+C-9  init_db.py 的 SQL 拆分器很脆弱
+      位置：init_db.py:58 `load_statements()` 按"行尾分号"切语句
+      影响：字段值里出现 "…;" （例如描述以分号结尾）就会被切坏；不支持
+            DELIMITER / 触发器 / 存储过程 → 以后想加触发器或视图就没法用这个脚本。
+      建议：改为显式语句列表或使用 mysqlclient 的 multi-statement 执行，
+            并支持 DELIMITER。
+
+C-10 无类型注解、无 lint/format 配置、无 pre-commit
+      影响：多人协作（课程通常分组）时风格不统一；也无法作为"工程规范"亮点。
+      建议：pytest-cov + ruff + black + mypy(基础配置) 四件套，写进 README 的开发章节。
+
+C-11 日志与可观测性不足
+      现状：只有 app.logger.exception（输出到 stderr），无文件日志、无请求 ID、
+            无耗时统计、无审计表。
+      影响：课程报告"日志与异常处理"章节缺素材；线上（演示）出问题难排查。
+      建议：logging 配 RotatingFileHandler 写 logs/app.log + 关键操作审计表。
+
+C-12 无数据库迁移方案
+      现状：schema 变更只能 `init_db.py --force` 清库重建；老库靠
+            REQUIRED_INDEXES 手工补索引（init_db.py:33-37）。
+      影响：升级=丢数据，不符合"迭代开发"的叙事。
+      建议：至少维护 migrations/001_xxx.sql 顺序执行；或引入 Alembic。
+
+--------------------------------------------------------------------------------
+六、[P1] 数据库设计层面
+--------------------------------------------------------------------------------
+D-1  registrations 外键无 ON DELETE CASCADE（同 P1-2），与 events 删除逻辑耦合在应用层。
+D-2  capacity 上限（防超卖）只由应用层保证，数据库没有约束/触发器兜底。
+     建议：课程若考察"数据库完整性"，加 BEFORE INSERT 触发器校验余量，
+           或把报名封装为存储过程（也顺便满足"存储过程/触发器"考核点）。
+D-3  数据完整性细节缺失：
+     · venues.available_status 无 CHECK (0/1) 约束；
+     · venues.capacity 允许 NULL（活动名额校验要判 None）；
+     · venue_name / category_name 无 UNIQUE，可重复录入；
+     · events 缺 updated_at，registrations 缺 cancelled_at/updated_at；
+     · 无 venue 时间冲突约束（同 P1-8）。
+D-4  枚举与状态字典：events.status 只有 open/closed（"已结束"靠时间推导，
+     与前端文案不一致）；registrations.status 混用取消与签到；新增状态要 ALTER TABLE。
+     建议：status 字典表 + 外键，或至少加 'ended' 状态由定时任务/触发器维护。
+D-5  时间类型混用 + 时区风险：
+     · registrations.registered_at / users.created_at 是 TIMESTAMP（受会话时区转换，
+       且有 2038 上限），check_in_time / events.start_time 是 DATETIME（不转换）；
+       同一系统两种语义，跨时区部署会相差 8 小时。
+     · schema.sql 里有 dump 带的 `SET TIME_ZONE='+00:00'`，但应用连接未显式设置
+       会话时区（db_config 无 time_zone），也不检查 MySQL 与操作系统的时区是否一致。
+     建议：统一用 DATETIME（或 UTC 存储 + 展示层转换），连接时显式
+           `SET time_zone = '+08:00'`，README 写清时区约定。
+D-6  索引可优化：
+     · /api/events 的排序 `ORDER BY (end_time<NOW()), start_time` 用不上 idx_start_time；
+     · 缺 events(venue_id, start_time, end_time)（做场地冲突检测/统计都要）；
+     · 缺 events(organizer_id, start_time)（"我的活动"）；
+     · comments(event_id, created_at) 组合索引（当前只有 event_id）。
+D-7  无视图/存储过程/触发器，也没有备份恢复脚本。
+     很多数据库课程明确要求至少演示其中一种，这里完全空白，可以直接加分。
+D-8  无数据库账号/权限设计：README 用 root 连库；init_db 的报错文案却建议
+     "配置数据库专用账号"，文档与实现口径不一致。
+
+--------------------------------------------------------------------------------
+七、[P2] 工程化、脚本与其它细节
+--------------------------------------------------------------------------------
+E-1  一键脚本只有 Windows 版（scripts/*.bat，GBK 编码 + 中文文件名）。
+     · macOS/Linux 同学无法一键启动（README 也没给等价的 sh 命令）；
+     · `首次安装并启动.bat` 里 init_db.py --force 需要交互输 YES，无法无人值守；
+     · .bat 中的中文在非中文 Windows（英文 codepage）下会乱码。
+     建议：补 scripts/setup.sh、scripts/start.sh、scripts/stop.sh；或提供
+           `make setup/run/test`；.bat 里统一 `chcp 65001`。
+E-2  requirements.txt 全部用 `>=`，无上限、无 lock 文件。
+     建议：requirements.txt 固定版本（==）或用 pip-tools 生成 requirements.lock。
+E-3  .gitignore 未忽略 `.pytest_cache/`（当前该目录就在项目里，`git add .` 会被带进去）；
+     也未忽略 logs/、*.sql.bak 等。
+E-4  项目内混入缓存与虚拟环境：.venv（32MB）、backend/__pycache__、tests/__pycache__、
+     .pytest_cache。压缩交付前应清理（README 也应提示"提交前删除 .venv"）。
+E-5  无 LICENSE、无 CHANGELOG/版本号、无 .editorconfig。
+E-6  README 与仓库现状不同步：目录结构树里没有 tests 之外的 make_admin？有；
+     但没写"如何查看 ER 图以外的设计文档"、没写"删除/退出管理员"、
+     也没有"常见问题（Q&A）"章节（例如 3307 端口、密码错误、端口占用）。
+E-7  .env 里 DB_PORT=3307，而 .env.example 默认 3306：换机器直接连不上且没有提示。
+     建议 README 的 Q&A 明确"端口以你本机 MySQL 服务为准"。
+E-8  代码注释里大量"相对原始版本的改动要点/本次重构（阶段 B）"这类开发过程叙述
+     （app.py:1-20），更像个人笔记而非项目文档；建议移到 docs/CHANGELOG 或
+     commit message 里，文件头只保留职责说明。
+E-9  测试文件命名 test_fixes.py（12 个用例混装）无法从名字看出测什么；
+     建议按功能拆分（test_permissions.py / test_pagination.py ...）。
+E-10 无性能/容量说明：活动大厅每行 2 个相关子查询（app.py:640-644），
+     数据量大时可优化为 JOIN + GROUP BY；README 也没有"性能优化"章节。
+
+================================================================================
+附一、答辩/验收前的修复顺序建议（按性价比排序）
+================================================================================
+  1. 提交并 push 全部改动（P0-1），清理仓库垃圾文件（P0-2）—— 不做等于交旧版。
+  2. 交付前删除 .env（P0-3），并更换已泄露的 MySQL 密码与 APP_SECRET_KEY。
+  3. 修 schema.sql 的建库语句 / README 建库命令（P0-6），否则老师第一步就报错。
+  4. 补 ER 图的 Comments 表 + README 表数量改 7（P1-1）—— 30 分钟，避免硬伤。
+  5. 修前端"进行中显示已结束"与 Safari 时间解析（P1-24、P1-25）—— 必踩的演示 bug。
+  6. 加"场地时间冲突校验"（P1-8）—— 唯一的功能性业务漏洞，答辩最可能被问。
+  7. 限流不信任 X-Forwarded-For（P0-4）、APP_SECRET_KEY 占位符校验（P1-7）。
+  8. 加独立测试库/清理（P1-21）+ pytest-cov 覆盖率（P1-22），写进测试报告。
+  9. 补演示数据脚本（P1-20）与活动详情接口（P1-15）。
+ 10. 文档四件套：时序图、数据字典、测试报告、界面截图（P1-5、P1-6）。
+
+附二、值得保留并在报告中强调的优点（写进"特色/创新"章节）
+  · 服务端从令牌解析身份，不信任前端 user_id/organizer_id（app.py:157-193）。
+  · 报名用 "事务 + SELECT ... FOR UPDATE" 防超卖（app.py:397-444, 698-735），
+    并有 2 线程并发用例。
+  · 时间先后与"是否已开始"交给数据库 NOW() 判定，规避应用/DB 时钟漂移。
+  · 全量参数化 SQL，无字符串拼接注入点（唯一动态拼接的 dbname 有白名单正则）。
+  · 密码 bcrypt 加盐 + 强度规则 + 72 字节上限；登录失败提示统一，避免枚举邮箱。
+  · 统一 AppError + db_cursor 上下文管理器，提交/回滚/关连接一致。
+  · 前端 escapeHtml 全量转义用户内容，README 明确存储型 XSS 防护。
+  · 76 个 pytest 用例覆盖认证、边界、并发、签到、评论、分类、限流，全部通过。
+
+================================================================================
+（本清单基于当前工作区代码逐行核对，行号对应本次审查版本；如后续改动请同步更新。）
+================================================================================
