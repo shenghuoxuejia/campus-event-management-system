@@ -446,12 +446,12 @@
     </div>
 
     <div class="header">
-        <h1>🎓 校园活动大厅</h1>
+        <h1>校园活动大厅</h1>
         <div class="user-info" id="user-info"></div>
     </div>
 
     <div id="organizer-panel" class="panel" style="display:none;">
-        <h3 id="panel-title">📢 发布新活动 <span style="color:#aaa; font-size:13px;">（仅组织者可见）</span></h3>
+        <h3 id="panel-title">发布新活动 <span style="color:#aaa; font-size:13px;">（仅组织者可见）</span></h3>
         <div class="form-grid">
             <input type="text" id="new-title" placeholder="活动标题">
             <input type="number" id="new-capacity" placeholder="容量（人数）">
@@ -468,9 +468,22 @@
     </div>
 
     <div id="admin-panel" class="panel" style="display:none;">
-        <h3>🛡️ 用户管理 <span style="color:#aaa; font-size:13px;">（仅管理员可见）</span></h3>
+        <h3>用户管理 <span style="color:#aaa; font-size:13px;">（仅管理员可见）</span></h3>
         <button class="btn-primary" onclick="loadAdminUsers()">加载用户列表</button>
+        <p style="color:#999; font-size:12px; margin-top:8px;">组织者可以提为管理员，管理员可以降回组织者；被修改的账号需要重新登录才会看到新面板。</p>
         <div id="admin-user-list" style="margin-top:15px;"></div>
+    </div>
+
+    <div id="venue-panel" class="panel" style="display:none;">
+        <h3>场地管理 <span style="color:#aaa; font-size:13px;">（仅管理员可见）</span></h3>
+        <div class="form-grid">
+            <input type="text" id="venue-name" placeholder="场地名称" maxlength="100">
+            <input type="text" id="venue-location" placeholder="位置（如 教学区B栋）" maxlength="255">
+            <input type="number" id="venue-capacity" placeholder="容量（人数）" min="1">
+        </div>
+        <button class="btn-primary" id="venue-submit-btn" onclick="submitVenue()">添加场地</button>
+        <button class="btn-toggle" id="venue-cancel-btn" style="display:none; width:auto; margin-left:10px;" onclick="resetVenueForm()">取消编辑</button>
+        <div id="admin-venue-list" style="margin-top:15px;"></div>
     </div>
 
     <div class="filter-bar" id="category-filter"></div>
@@ -551,7 +564,7 @@
             }
             return `${y}年${parseInt(m)}月${parseInt(d)}日 ${hh}:${mm}`;
         }
-        // 修复 Safari：'2026-01-01 10:00:00' → '2026-01-01T10:00:00'
+        // Safari 不认 '2026-01-01 10:00:00' 这种格式，得换成 '2026-01-01T10:00:00'
         function parseDbTime(s) {
             if (!s) return null;
             const d = new Date(String(s).replace(' ', 'T'));
@@ -565,11 +578,14 @@
             <button onclick="logout()">退出</button>
         `;
 
-        if (currentUser.role === 'organizer') {
+        // 管理员也能发活动（后端 create_event 允许 organizer 和 admin）
+        if (currentUser.role === 'organizer' || currentUser.role === 'admin') {
             document.getElementById('organizer-panel').style.display = 'block';
         }
         if (currentUser.role === 'admin') {
             document.getElementById('admin-panel').style.display = 'block';
+            document.getElementById('venue-panel').style.display = 'block';
+            loadAdminVenues();
         }
 
         // 管理员 / 活动组织者本人 都可管理活动
@@ -598,13 +614,13 @@
                 });
                 const data = await response.json();
                 if (data.code === 200) {
-                    showToast('✓ 活动已删除');
+                    showToast('活动已删除');
                     loadEvents('refresh');
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (error) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = '删除活动'; }
             }
@@ -627,13 +643,13 @@
                 });
                 const data = await response.json();
                 if (data.code === 200) {
-                    showToast('✓ ' + data.message);
+                    showToast(data.message);
                     loadEvents('refresh');
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (error) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             }
         }
 
@@ -684,11 +700,11 @@
             card.innerHTML = `
                 <span class="status-badge ${statusClass}">${statusText}</span>
                 <div>${categoryTags}</div>
-                <h3 style="cursor:pointer;" onclick="openDetail(${event.event_id})">${escapeHtml(event.title)} <span style="font-size:12px; color:#07c160;">详情 →</span></h3>
+                <h3 style="cursor:pointer;" onclick="openDetail(${event.event_id})">${escapeHtml(event.title)} <span style="font-size:12px; color:#07c160;">查看详情</span></h3>
                 <p>${escapeHtml(event.description || '暂无描述')}</p>
-                <p>📍 地点：${escapeHtml(event.venue_name || '待定')}（${escapeHtml(event.venue_location || '')}）</p>
-                <p>📅 时间：${formatDateTime(event.start_time)}</p>
-                <p>👥 容量：${event.capacity} 人 · 已报 ${event.registered_count} · 余 ${event.remaining}</p>
+                <p>地点：${escapeHtml(event.venue_name || '待定')}（${escapeHtml(event.venue_location || '')}）</p>
+                <p>时间：${formatDateTime(event.start_time)}</p>
+                <p>容量：${event.capacity} 人，已报 ${event.registered_count} 人，余 ${event.remaining} 人</p>
                 ${applyBtn}
                 ${manageBtns}
             `;
@@ -766,13 +782,13 @@
                 });
                 const data = await response.json();
                 if (data.code === 200) {
-                    showToast('✓ 报名成功');
+                    showToast('报名成功');
                     loadEvents('refresh');
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (error) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = '立即报名'; }
             }
@@ -791,7 +807,7 @@
             ['new-title', 'new-capacity', 'new-venue-id', 'new-start-time', 'new-end-time', 'new-description']
                 .forEach(id => document.getElementById(id).value = '');
             setSelectedCategoryIds([]);
-            document.getElementById('panel-title').textContent = '📢 发布新活动';
+            document.getElementById('panel-title').textContent = '发布新活动';
             document.getElementById('publish-btn').textContent = '发布活动';
             document.getElementById('cancel-edit-btn').style.display = 'none';
         }
@@ -808,7 +824,7 @@
             document.getElementById('new-end-time').value = toInputValue(ev.end_time);
             document.getElementById('new-description').value = ev.description || '';
             setSelectedCategoryIds((ev.categories || []).map(c => c.category_id));
-            document.getElementById('panel-title').textContent = `✏️ 编辑活动：#${ev.event_id}`;
+            document.getElementById('panel-title').textContent = `编辑活动：#${ev.event_id}`;
             document.getElementById('publish-btn').textContent = '保存修改';
             document.getElementById('cancel-edit-btn').style.display = 'inline-block';
             document.getElementById('organizer-panel').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -823,7 +839,7 @@
             const description = document.getElementById('new-description').value;
 
             if (!title || !capacity || !venueId || !startTime || !endTime) {
-                showToast('⚠ 请填写所有必填字段');
+                showToast('请填写所有必填字段');
                 return;
             }
 
@@ -847,14 +863,14 @@
                 });
                 const data = await response.json();
                 if (data.code === 200) {
-                    showToast('✓ ' + data.message);
+                    showToast(data.message);
                     resetEventForm();
                     loadEvents();
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (error) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             } finally {
                 btn.disabled = false;
                 btn.textContent = editingEventId ? '保存修改' : '发布活动';
@@ -868,6 +884,8 @@
                 const result = await response.json();
                 const select = document.getElementById('new-venue-id');
                 if (result.code === 200) {
+                    // 只保留第一个「请选择场地」，避免刷新后重复追加
+                    select.length = 1;
                     result.data.forEach(venue => {
                         const option = document.createElement('option');
                         option.value = venue.venue_id;
@@ -943,7 +961,7 @@
             currentEventId = eventId;
             const res = await fetch(`/api/events/${eventId}`);
             const result = await res.json();
-            if (result.code !== 200) { showToast('✗ ' + result.message); return; }
+            if (result.code !== 200) { showToast(result.message); return; }
             currentEvent = result.data;
 
             document.getElementById('modal-title').textContent = currentEvent.title;
@@ -978,7 +996,7 @@
                 const when = reg.cancelled_at ? formatDateTime(reg.cancelled_at) : '';
                 actionHtml = `<span class="checkin-status">已取消${who} ${when}</span>`;
             } else if (isCheckedIn) {
-                actionHtml = `<span class="checkin-status">✓ 已签到</span>
+                actionHtml = `<span class="checkin-status">已签到</span>
                    <button class="btn-undo-checkin" onclick="undoCheckIn(${reg.registration_id}, this)">撤销签到</button>`;
             } else {
                 actionHtml = `<button class="btn-checkin" onclick="checkInStudent(${reg.registration_id}, this)">签到</button>
@@ -1038,14 +1056,14 @@
                 const res = await fetch(`/api/remove_registration/${registrationId}`, { method: 'DELETE' });
                 const data = await res.json();
                 if (data.code === 200) {
-                    showToast('✓ ' + data.message);
+                    showToast(data.message);
                     await loadEventRegistrations(currentEventId, true);
                     loadEvents('refresh');
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (err) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             }
         }
 
@@ -1061,13 +1079,13 @@
                 });
                 const data = await res.json();
                 if (data.code === 200) {
-                    showToast('✓ 签到成功');
+                    showToast('签到成功');
                     await loadEventRegistrations(currentEventId);
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (err) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = '签到'; }
             }
@@ -1085,13 +1103,13 @@
                 });
                 const data = await res.json();
                 if (data.code === 200) {
-                    showToast('✓ 已撤销签到');
+                    showToast('已撤销签到');
                     await loadEventRegistrations(currentEventId);
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (err) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = '撤销签到'; }
             }
@@ -1107,13 +1125,13 @@
                 });
                 const data = await res.json();
                 if (data.code === 200) {
-                    showToast('✓ 评论已删除');
+                    showToast('评论已删除');
                     await loadComments(currentEventId);
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (err) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             }
         }
 
@@ -1178,7 +1196,7 @@
         // 发表评论
         async function submitComment(btn) {
             const content = document.getElementById('comment-input').value.trim();
-            if (!content) { showToast('⚠ 请输入评论内容'); return; }
+            if (!content) { showToast('请输入评论内容'); return; }
             if (btn) { btn.disabled = true; btn.textContent = '发布中…'; }
             try {
                 const res = await fetch('/api/comments', {
@@ -1192,13 +1210,13 @@
                 const data = await res.json();
                 if (data.code === 200) {
                     document.getElementById('comment-input').value = '';
-                    showToast('✓ 评论已发布');
+                    showToast('评论已发布');
                     await loadComments(currentEventId);
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (err) {
-                showToast('⚠ 网络错误');
+                showToast('网络错误，请稍后重试');
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = '发表评论'; }
             }
@@ -1226,7 +1244,10 @@
                             <div class="name">#${u.user_id} ${escapeHtml(u.name)}</div>
                             <div class="email">${escapeHtml(u.email)}</div>
                         </div>
-                        <span class="status-badge ${u.role === 'admin' ? 'status-closed' : 'status-open'}">${escapeHtml(u.role)}</span>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <span class="status-badge ${u.role === 'admin' ? 'status-closed' : 'status-open'}" style="margin-bottom:0;">${escapeHtml(u.role)}</span>
+                            ${roleButton(u)}
+                        </div>
                     </div>
                 `).join('');
                 if (reset) {
@@ -1252,6 +1273,180 @@
             }
         }
 
+        // 角色按钮：只有组织者能提成管理员、管理员能降回组织者，学生和自己不显示
+        function roleButton(user) {
+            if (user.user_id === currentUser.user_id) {
+                return '<span style="color:#aaa; font-size:12px;">当前账号</span>';
+            }
+            if (user.role === 'organizer') {
+                return `<button class="btn-toggle" style="width:auto; margin:0; padding:6px 12px;" onclick="setUserRole(${user.user_id}, 'admin')">设为管理员</button>`;
+            }
+            if (user.role === 'admin') {
+                return `<button class="btn-toggle" style="width:auto; margin:0; padding:6px 12px;" onclick="setUserRole(${user.user_id}, 'organizer')">降为组织者</button>`;
+            }
+            return '';
+        }
+
+        async function setUserRole(userId, role) {
+            const label = role === 'admin' ? '管理员' : '组织者';
+            const ok = await showConfirm(`确定把这个账号设为${label}吗？对方需要重新登录才会看到新的面板。`);
+            if (!ok) return;
+            try {
+                const res = await fetch(`/api/admin/users/${userId}/role`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ role: role })
+                });
+                const data = await res.json();
+                showToast(data.message || '已更新');
+                if (data.code === 200) {
+                    await loadAdminUsers();
+                }
+            } catch (err) {
+                showToast('网络错误，请稍后重试');
+            }
+        }
+
+        // 管理员：场地管理
+        let adminVenues = [];
+        let editingVenueId = null;
+        let editingVenueStatus = 1;
+
+        async function loadAdminVenues() {
+            const box = document.getElementById('admin-venue-list');
+            box.innerHTML = '<p class="empty-tip">加载中...</p>';
+            try {
+                const res = await fetch('/api/admin/venues');
+                const result = await res.json();
+                if (result.code !== 200) {
+                    box.innerHTML = `<p class="empty-tip" style="color:#fa5151;">${escapeHtml(result.message || '加载失败')}</p>`;
+                    return;
+                }
+                adminVenues = result.data;
+                if (!adminVenues.length) {
+                    box.innerHTML = '<p class="empty-tip">还没有场地，先在上面加一个</p>';
+                    return;
+                }
+                box.innerHTML = adminVenues.map(v => `
+                    <div class="reg-item">
+                        <div>
+                            <div class="name">#${v.venue_id} ${escapeHtml(v.venue_name)}</div>
+                            <div class="email">${escapeHtml(v.location || '未填位置')}，容量 ${v.capacity} 人，已排 ${v.event_count} 个活动</div>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <span class="status-badge ${v.available_status ? 'status-open' : 'status-closed'}" style="margin-bottom:0;">${v.available_status ? '可用' : '停用'}</span>
+                            <button class="btn-toggle" style="width:auto; margin:0; padding:6px 12px;" onclick="editVenue(${v.venue_id})">编辑</button>
+                            <button class="btn-toggle" style="width:auto; margin:0; padding:6px 12px;" onclick="toggleVenue(${v.venue_id})">${v.available_status ? '停用' : '启用'}</button>
+                            <button class="btn-delete" style="width:auto; margin:0; padding:6px 12px;" onclick="deleteVenue(${v.venue_id})">删除</button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (err) {
+                box.innerHTML = '<p class="empty-tip" style="color:#fa5151;">加载失败</p>';
+            }
+        }
+
+        function editVenue(venueId) {
+            const venue = adminVenues.find(v => v.venue_id === venueId);
+            if (!venue) return;
+            editingVenueId = venueId;
+            editingVenueStatus = venue.available_status;
+            document.getElementById('venue-name').value = venue.venue_name;
+            document.getElementById('venue-location').value = venue.location || '';
+            document.getElementById('venue-capacity').value = venue.capacity;
+            document.getElementById('venue-submit-btn').textContent = '保存修改';
+            document.getElementById('venue-cancel-btn').style.display = 'inline-block';
+        }
+
+        function resetVenueForm() {
+            editingVenueId = null;
+            editingVenueStatus = 1;
+            ['venue-name', 'venue-location', 'venue-capacity'].forEach(id => {
+                document.getElementById(id).value = '';
+            });
+            document.getElementById('venue-submit-btn').textContent = '添加场地';
+            document.getElementById('venue-cancel-btn').style.display = 'none';
+        }
+
+        // 新增 / 修改共用
+        async function submitVenue() {
+            const name = document.getElementById('venue-name').value.trim();
+            const location = document.getElementById('venue-location').value.trim();
+            const capacity = document.getElementById('venue-capacity').value;
+            if (!name || !capacity) {
+                showToast('请填写场地名称和容量');
+                return;
+            }
+            const editing = editingVenueId !== null;
+            const btn = document.getElementById('venue-submit-btn');
+            btn.disabled = true;
+            try {
+                const res = await fetch(editing ? `/api/venues/${editingVenueId}` : '/api/venues', {
+                    method: editing ? 'PUT' : 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        venue_name: name,
+                        location: location,
+                        capacity: parseInt(capacity, 10),
+                        available_status: editing ? editingVenueStatus : 1
+                    })
+                });
+                const data = await res.json();
+                showToast(data.message || (data.code === 200 ? '已保存' : '保存失败'));
+                if (data.code === 200) {
+                    resetVenueForm();
+                    await loadAdminVenues();
+                    await loadVenues();
+                }
+            } catch (err) {
+                showToast('网络错误，请稍后重试');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // 停用 / 启用：停用后发布活动时就选不到它了
+        async function toggleVenue(venueId) {
+            const venue = adminVenues.find(v => v.venue_id === venueId);
+            if (!venue) return;
+            try {
+                const res = await fetch(`/api/venues/${venueId}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        venue_name: venue.venue_name,
+                        location: venue.location || '',
+                        capacity: venue.capacity,
+                        available_status: venue.available_status ? 0 : 1
+                    })
+                });
+                const data = await res.json();
+                showToast(data.message || '已更新');
+                if (data.code === 200) {
+                    await loadAdminVenues();
+                    await loadVenues();
+                }
+            } catch (err) {
+                showToast('网络错误，请稍后重试');
+            }
+        }
+
+        async function deleteVenue(venueId) {
+            const ok = await showConfirm('确定要删除这个场地吗？');
+            if (!ok) return;
+            try {
+                const res = await fetch(`/api/venues/${venueId}`, { method: 'DELETE' });
+                const data = await res.json();
+                showToast(data.message || '已删除');
+                if (data.code === 200) {
+                    await loadAdminVenues();
+                    await loadVenues();
+                }
+            } catch (err) {
+                showToast('网络错误，请稍后重试');
+            }
+        }
+
         loadVenues();
         loadCategories();
         loadEvents();
@@ -1266,7 +1461,7 @@
             </div>
             <div class="modal-body">
                 <div class="section" id="registration-section">
-                    <h4>👥 报名名单
+                    <h4>报名名单
                         <label style="font-size:12px; font-weight:normal; color:#888; margin-left:10px; cursor:pointer;">
                             <input type="checkbox" id="show-cancelled"
                                    onchange="loadEventRegistrations(currentEventId, true)"> 显示已取消
@@ -1278,7 +1473,7 @@
                     </div>
                 </div>
                 <div class="section">
-                    <h4>💬 评论区</h4>
+                    <h4>评论区</h4>
                     <div id="comment-list"></div>
                     <div style="text-align:center;">
                         <button class="btn-toggle" id="load-more-comments" style="display:none;" onclick="loadMoreComments()">加载更多评论</button>

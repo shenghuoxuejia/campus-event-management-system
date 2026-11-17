@@ -17,6 +17,10 @@ htmlcov/
 .env.local
 *.env.local
 
+# ---- 账号密码等本机凭据：不要提交 ----
+管理员账号.txt
+*账号*.txt
+
 # ---- 日志与系统文件 ----
 *.log
 logs/

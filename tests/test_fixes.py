@@ -144,7 +144,7 @@ def test_login_created_at_is_formatted(client, make_user):
     assert len(user['created_at']) == 19
     assert user['created_at'][4] == '-' and user['created_at'][13] == ':'
 
-    # ---------------- 时间窗限制（P1-11） ----------------
+    # ---------------- 时间窗限制 ----------------
 
 def test_cannot_cancel_after_start(client, auth, active_scene):
     """活动开始后，学生本人不能取消报名。"""
@@ -173,7 +173,7 @@ def test_cannot_undo_check_in_after_end(client, auth, ended_scene, db):
     assert '已结束' in resp.get_json()['message']
 
 
-# ---------------- 删除活动保护（P1-9） ----------------
+# ---------------- 删除活动保护 ----------------
 
 def test_cannot_delete_event_with_check_in(client, auth, active_scene):
     """已有签到记录的活动不能删除（409）。"""
@@ -195,7 +195,7 @@ def test_cannot_delete_started_event_by_organizer(client, auth, active_scene):
     assert '已开始' in resp.get_json()['message']
 
 
-    # ---------------- 取消留痕（P1-10） ----------------
+# ---------------- 取消留痕 ----------------
 
 def test_cancel_records_cancelled_at_and_by(client, auth, event, registration, db):
     rid = registration['registration_id']

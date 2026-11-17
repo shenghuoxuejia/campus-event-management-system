@@ -239,7 +239,7 @@
     </div>
 
     <div class="header">
-        <h1>📋 我的报名</h1>
+        <h1>我的报名</h1>
         <div>
             <a href="index.html">返回大厅</a>
             <a href="#" onclick="logout()">退出登录</a>
@@ -250,7 +250,7 @@
 
     <!-- 修改密码 -->
     <div class="container" style="margin-top:20px;">
-        <h3 style="margin-bottom:12px; font-size:15px;">🔑 修改密码</h3>
+        <h3 style="margin-bottom:12px; font-size:15px;">修改密码</h3>
         <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
             <input type="password" id="old-password" placeholder="旧密码" autocomplete="current-password"
                    style="flex:1; min-width:160px; padding:10px; border:1px solid #e5e5e5; border-radius:8px;">
@@ -378,15 +378,15 @@
                             : '';
 
                         const checkinLine = reg.check_in_time
-                            ? `<p>✅ 签到时间：${formatDateTime(reg.check_in_time)}</p>`
+                            ? `<p>签到时间：${formatDateTime(reg.check_in_time)}</p>`
                             : '';
 
                         card.innerHTML = `
                         <div class="reg-info">
                             <h3>${escapeHtml(reg.event_title)}</h3>
-                            <p>📍 地点：${escapeHtml(reg.venue_name)}（${escapeHtml(reg.location)}）</p>
-                            <p>📅 活动时间：${formatDateTime(reg.start_time)}</p>
-                            <p>📝 报名时间：${formatDateTime(reg.registered_at)}</p>
+                            <p>地点：${escapeHtml(reg.venue_name)}（${escapeHtml(reg.location)}）</p>
+                            <p>活动时间：${formatDateTime(reg.start_time)}</p>
+                            <p>报名时间：${formatDateTime(reg.registered_at)}</p>
                             ${checkinLine}
                         </div>
                         <div style="text-align: right;">
@@ -429,14 +429,14 @@
                 const response = await fetch(`/api/cancel_registration/${registrationId}`, { method: 'PUT' });
                 const data = await response.json();
                 if (data.code === 200) {
-                    showToast('✓ ' + data.message);
+                    showToast(data.message);
                     loadMyRegistrations();
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                     if (btn) { btn.disabled = false; btn.textContent = '取消报名'; }
                 }
             } catch (error) {
-                showToast('⚠ 网络错误，请检查后端');
+                showToast('网络错误，请稍后重试');
                 if (btn) { btn.disabled = false; btn.textContent = '取消报名'; }
             }
         }
@@ -444,7 +444,7 @@
         async function changePassword(btn) {
             const oldPwd = document.getElementById('old-password').value;
             const newPwd = document.getElementById('new-password').value;
-            if (!oldPwd || !newPwd) { showToast('⚠ 请填写旧密码和新密码'); return; }
+            if (!oldPwd || !newPwd) { showToast('请填写旧密码和新密码'); return; }
             if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
             try {
                 const response = await fetch('/api/change_password', {
@@ -454,16 +454,16 @@
                 });
                 const data = await response.json();
                 if (data.code === 200) {
-                    showToast('✓ ' + data.message);
+                    showToast(data.message);
                     // 旧令牌已失效，直接用返回的新令牌续上，或重新登录
                     if (data.token) localStorage.setItem('token', data.token);
                     document.getElementById('old-password').value = '';
                     document.getElementById('new-password').value = '';
                 } else {
-                    showToast('✗ ' + data.message);
+                    showToast(data.message);
                 }
             } catch (error) {
-                showToast('⚠ 网络错误，请检查后端');
+                showToast('网络错误，请稍后重试');
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = '确认修改'; }
             }
