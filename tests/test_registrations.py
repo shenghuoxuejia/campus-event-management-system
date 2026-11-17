@@ -22,42 +22,65 @@ def _create_event(client, token, venue_id, window):
     return resp.get_json()['data']['event_id']
 
 
-def test_no_oversell(app, client, make_user, unique_event_window):
-    # 容量 1 的活动两个线程一起抢，只能成功一个
+OVERSOLD_ROUNDS = 8
+
+
+def test_no_oversell(app, client, make_user, unique_event_window, db_fetch):
+    """容量 1 的活动，两线程同时抢：只能一个成功，且失败原因必须是名额已满。
+
+    用 threading.Barrier 保证两个请求真的同时发出（否则线程可能先后跑完，
+    不加行锁的实现也能通过），并跑多轮降低偶发通过的概率。
+    """
     _, org_token = make_user('organizer')
     _, tok_a = make_user('student')
     _, tok_b = make_user('student')
 
     venues = client.get('/api/venues', headers=_h(org_token)).get_json()['data']
-    start, end = unique_event_window()
-    resp = client.post('/api/create_event', headers=_h(org_token), json={
-        'title': f'并发测试活动_{uuid.uuid4().hex[:8]}',
-        'description': '容量 1',
-        'venue_id': venues[0]['venue_id'],
-        'start_time': start,
-        'end_time': end,
-        'capacity': 1,
-    })
-    assert resp.status_code == 200, resp.get_json()
-    event_id = resp.get_json()['data']['event_id']
 
-    results = []
+    for round_no in range(OVERSOLD_ROUNDS):
+        start, end = unique_event_window()
+        resp = client.post('/api/create_event', headers=_h(org_token), json={
+            'title': f'并发测试活动_{round_no}_{uuid.uuid4().hex[:8]}',
+            'description': '容量 1',
+            'venue_id': venues[0]['venue_id'],
+            'start_time': start,
+            'end_time': end,
+            'capacity': 1,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        event_id = resp.get_json()['data']['event_id']
 
-    def attempt(token):
-        # 线程之间不能共用 test_client
-        with app.test_client() as c:
-            r = c.post('/api/register_event', headers=_h(token),
-                       json={'event_id': event_id})
-            results.append(r.status_code)
+        barrier = threading.Barrier(2)
+        results = []
 
-    t1 = threading.Thread(target=attempt, args=(tok_a,))
-    t2 = threading.Thread(target=attempt, args=(tok_b,))
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+        def attempt(token):
+            # 线程之间不能共用 test_client
+            with app.test_client() as c:
+                barrier.wait()          # 两个请求卡在起跑线上
+                r = c.post('/api/register_event', headers=_h(token),
+                           json={'event_id': event_id})
+                results.append((r.status_code, r.get_json().get('message', '')))
 
-    assert sorted(results) == [200, 400]
+        threads = [threading.Thread(target=attempt, args=(tok,))
+                   for tok in (tok_a, tok_b)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        codes = sorted(code for code, _ in results)
+        assert codes == [200, 400], f'第 {round_no} 轮结果 {results}'
+
+        loser = next(msg for code, msg in results if code == 400)
+        assert '名额已满' in loser, f'失败原因不对：{loser}'
+
+        # 库里必须只有一条有效报名（超卖的话这里会是 2）
+        rows = db_fetch(
+            "SELECT COUNT(*) AS cnt FROM registrations "
+            "WHERE event_id = %s AND status <> 'cancelled'",
+            (event_id,),
+        )
+        assert rows[0]['cnt'] == 1, f'第 {round_no} 轮超卖了：{rows[0]["cnt"]} 条报名'
 
 
 def test_organizer_cannot_register_event(client, auth, event, make_user):
