@@ -113,7 +113,7 @@
 </head>
 <body>
 
-<!-- 统一为所有 API 请求附带登录令牌；令牌失效自动跳回登录页 -->
+<!-- 401 自动回登录页 -->
 <script>
     (function () {
         const _fetch = window.fetch.bind(window);
@@ -183,13 +183,13 @@
     </div>
 </div>
 
-<!-- Toast 提示组件 -->
+<!-- 提示条 -->
 <div id="toast" class="toast">
     <span id="toast-text"></span>
 </div>
 
 <script>
-    // Toast 提示
+    // 提示条
     function showToast(message, duration = 1500) {
         const toast = document.getElementById('toast');
         const text = document.getElementById('toast-text');
@@ -200,7 +200,6 @@
         }, duration);
     }
 
-    // 表单切换
     function toggleForm(formType) {
         const loginForm = document.getElementById('login-form');
         const registerForm = document.getElementById('register-form');
@@ -272,7 +271,7 @@
             });
             const data = await response.json();
             if (data.code === 200) {
-                // 注册接口直接返回令牌，这里直接当登录用，不再让用户重输一遍密码
+                // 注册接口直接给令牌，这里当登录用
                 localStorage.setItem('user', JSON.stringify(data.data));
                 localStorage.setItem('token', data.token);
                 showToast('注册成功，正在进入...');

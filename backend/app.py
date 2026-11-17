@@ -1,8 +1,4 @@
-"""
-校园活动报名与管理系统 - 后端主程序
-
-业务接口、登录认证、限流和数据库读写都在这个文件里。
-"""
+"""后端主程序：接口都在 /api/ 下，前端静态页也由这里托管。"""
 
 import os
 import re
@@ -19,19 +15,19 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-# 目录常量：app.py 位于 backend/，资源相对项目根目录定位
+# 路径常量：app.py 在 backend/ 里，资源按项目根目录找
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # backend/
 PROJECT_ROOT = os.path.dirname(BASE_DIR)                 # 项目根目录
 FRONTEND_DIR = os.path.join(PROJECT_ROOT, 'frontend')    # 根目录/frontend
 
-# 可选：如果安装了 python-dotenv，则自动加载项目根目录下的 .env（便于本地开发）
+# 装了 python-dotenv 就顺手读一下 .env
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 except ImportError:
     pass
 
-# 配置：凭据只来自环境变量
+# 数据库配置，全部从环境变量取
 db_config = {
     'host': os.environ.get('DB_HOST', '127.0.0.1'),
     'port': int(os.environ.get('DB_PORT', '3306')),
@@ -39,8 +35,7 @@ db_config = {
     'password': os.environ.get('DB_PASSWORD'),          # 必填，见 .env.example
     'database': os.environ.get('DB_NAME', 'campus_events'),
     'charset': 'utf8mb4',
-    # 会话时区固定为东八区：所有 NOW() 判断都基于同一时区，
-    # 避免 MySQL 服务器时区为 UTC 时「报名/签到时间窗」整体偏 8 小时。
+    # 固定东八区，否则 MySQL 是 UTC 时 NOW() 会让报名/签到时间窗差 8 小时
     'time_zone': os.environ.get('DB_TIME_ZONE', '+08:00'),
 }
 APP_SECRET_KEY = os.environ.get('APP_SECRET_KEY')       # 必填，见 .env.example
@@ -62,7 +57,7 @@ if APP_SECRET_KEY in _PLACEHOLDER_SECRETS or len(APP_SECRET_KEY) < 32:
         '请用 python -c "import secrets; print(secrets.token_urlsafe(48))" 重新生成。'
     )
 
-# DB 密码占位符校验（仅提示，不拒绝启动；init_db.py 还需能跑）
+# 密码还是占位符时只警告，不拦启动（init_db.py 还得能跑）
 if os.environ.get('DB_PASSWORD') and '在这里填' in os.environ['DB_PASSWORD']:
     print('[警告] DB_PASSWORD 仍是占位符，连库会失败。请打开 .env 填入真实密码。')
 
@@ -89,7 +84,7 @@ class AppError(Exception):
 
 @app.after_request
 def add_no_cache_header(response):
-    # 只对 API 响应禁用缓存；静态 HTML/CSS/JS 允许浏览器缓存
+    # API 不缓存，静态页照旧缓存
     if request.path.startswith('/api/'):
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
@@ -97,12 +92,12 @@ def add_no_cache_header(response):
     return response
 
 
-# 基础工具
+# 连接池
 _db_pool = None
 
 
 def _get_pool():
-    """惰性初始化连接池（连接按需创建）。"""
+    """第一次用到时才建池子。"""
     global _db_pool
     if _db_pool is None:
         _db_pool = pooling.MySQLConnectionPool(
@@ -115,11 +110,7 @@ def _get_pool():
 
 
 def get_conn():
-    """从连接池取一个数据库连接。调用方负责关闭（归还池）。
-
-    MySQL 侧 wait_timeout 到期后池里可能是死连接，取出后先 ping 一次
-    （reconnect=True 会自动重连），避免偶发 500。
-    """
+    """从池里取个连接，调用方负责关。池里的连接可能已被 wait_timeout 掐掉，先 ping 一下。"""
     conn = _get_pool().get_connection()
     try:
         conn.ping(reconnect=True, attempts=1, delay=0)
@@ -135,19 +126,9 @@ def get_conn():
 @contextmanager
 def db_cursor(*, commit=False, action=None, error_message=None,
               conflict_message=None):
-    """统一 DB 访问：负责开连接、开游标、提交/回滚、关闭，并统一处理数据库异常。
+    """数据库操作的统一入口：开连接、开游标、提交 / 回滚、关连接，顺手把 DB 异常转成 500。
 
-    - 正常退出且 commit=True 时提交；
-    - 任何异常（含 AppError）都会回滚并原样向上抛；
-    - mysql.connector.Error 统一转成 500 的 AppError 并记录日志，
-      各路由不用再写 try/except 模板；
-    - 唯一键冲突（errno 1062）转成业务错误，文案由 conflict_message 指定；
-    - 无论何种退出路径，连接都会被关闭。
-
-    参数：
-      action           本次数据库操作的中文名（写日志用，如「查询活动列表」）
-      error_message    数据库出错时返回给前端的文案（默认「服务异常，请稍后重试」）
-      conflict_message 唯一键冲突时返回给前端的文案（默认「数据已存在，请勿重复提交」）
+    action 是写日志用的中文名，error_message / conflict_message 是出错和唯一键冲突时给前端的文案。
     """
     conn = get_conn()
     try:
@@ -211,7 +192,7 @@ def auth_user():
     row = _load_user_row(payload.get('uid'), include_version=True)
     if row is None:
         return None
-    # token_version 不一致说明用户已登出 / 改过密码，旧令牌作废
+    # token_version 对不上 = 已登出或改过密码，旧令牌作废
     if int(payload.get('tv') or 0) != int(row.get('token_version') or 0):
         return None
     row.pop('token_version', None)
@@ -300,10 +281,8 @@ def _page_payload(page, page_size, total):
     return {'total': total, 'page': page, 'page_size': page_size, 'pages': pages}
 
 
-# ---------------------------------------------------------------------------
-# 简易限流（单进程内存实现）：防暴力破解 / 恶意注册
-# 配置格式为「次数/窗口秒数」，例如 LOGIN_RATE_LIMIT=10/60
-# ---------------------------------------------------------------------------
+# 简易限流（单进程内存版），防暴力破解和恶意注册
+# 配置写成「次数/窗口秒数」，比如 LOGIN_RATE_LIMIT=10/60
 _rate_lock = threading.Lock()
 _rate_buckets = {}
 
@@ -376,12 +355,11 @@ def reset_rate_limit(key):
         _rate_buckets.pop(key, None)
 
 
-# 业务辅助函数
 def validate_password(password):
     """校验密码规则。返回 (ok, message)。"""
     if len(password) < 8:
         return False, "密码长度不能少于 8 位"
-    # bcrypt 只接受 72 字节以内的密码，超出会直接报错，这里提前拦下
+    # bcrypt 只吃 72 字节，超了直接报错，先拦一下
     if len(password.encode('utf-8')) > 72:
         return False, "密码过长（最多 72 个字节）"
     if not any(c.isupper() for c in password):
@@ -412,8 +390,7 @@ def _validate_datetime(value, field_label):
 
 
 def _get_venue(cur, venue_id):
-    """读取可用场地；FOR UPDATE 让同一场地的发布/编辑串行化，
-    否则两个并发发布可能同时通过「场地时间冲突」检查而真正撞场地。"""
+    """读可用场地并加行锁，不然两个并发发布可能同时通过时间冲突检查。"""
     cur.execute(
         "SELECT venue_id, capacity FROM venues "
         "WHERE venue_id = %s AND available_status = 1 FOR UPDATE",
@@ -495,7 +472,7 @@ def _count_active_registrations(cur, event_id):
 def _upsert_registration(cur, existing, user_id, event_id):
     """报名或重新报名。返回 (提示语, registration_id)。"""
     if existing:
-        # 保留首次报名时间：排队顺序和「第几次报名」的历史不会被重新报名覆盖
+        # 重新报名复用原来那行，首次报名时间不被覆盖
         cur.execute(
             "UPDATE registrations SET status = 'registered', "
             "check_in_time = NULL, cancelled_at = NULL, cancelled_by = NULL "
@@ -514,11 +491,7 @@ def _upsert_registration(cur, existing, user_id, event_id):
 
 
 def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=None, current=None):
-    """校验并规整「发布 / 编辑活动」的字段，返回可直接写入数据库的 dict。
-
-    current 为编辑时库里的旧值（venue_id / start_time / end_time）；
-    场地与时间段都没变时跳过冲突重检，避免老数据本来就重叠时连标题都改不了。
-    """
+    """校验并规整发布 / 编辑活动的字段，通过就返回能直接入库的 dict。"""
     title = (data.get('title') or '').strip()
     description = (data.get('description') or '').strip()
     venue_id = data.get('venue_id')
@@ -548,15 +521,14 @@ def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=
     if venue['capacity'] is not None and capacity > venue['capacity']:
         raise AppError(f"名额超过了场地容量（{venue['capacity']}）")
 
-    # 时间校验交给数据库：结束时间必须晚于开始时间
+    # 结束时间必须晚于开始时间（DB 层也有 CHECK 兜底）
     if not _is_time_order_valid(cur, start_time, end_time):
         raise AppError("结束时间必须晚于开始时间")
 
     if require_future and not _is_start_in_future(cur, start_time):
         raise AppError("开始时间必须晚于当前时间")
 
-    # 场地时间冲突校验：同场地、不同活动、时间段有交集
-    # 区间重叠判断：existing.start < new.end AND existing.end > new.start
+    # 区间重叠：existing.start < new.end AND existing.end > new.start
     unchanged = bool(
         current
         and venue['venue_id'] == current.get('venue_id')
@@ -589,7 +561,6 @@ def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=
     }
 
 
-# 分类辅助函数
 def _parse_category_ids(raw):
     """把前端传来的 category_ids 规整为去重后的正整数列表；非法值抛 AppError。"""
     if raw is None:
@@ -637,7 +608,6 @@ def _apply_event_categories(cur, event_id, raw_category_ids):
     return category_ids
 
 
-# 用户注册
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json(silent=True) or {}
@@ -675,12 +645,11 @@ def register():
         )
         user = cur.fetchone()
 
-    # 注册完直接发令牌，前端不用再让用户输一次邮箱密码
+    # 注册完直接发令牌，前端不用再登一次
     token = issue_token(user['user_id'], 0)
     return ok("注册成功，已自动登录", data=fmt_row(user, 'created_at'), token=token)
 
 
-# 用户登录
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json(silent=True) or {}
@@ -690,7 +659,7 @@ def login():
     if not email or not password:
         raise AppError("邮箱和密码不能为空")
 
-    # 按「IP + 邮箱」限流，防止对单一账号暴力破解
+    # 按 IP + 邮箱限流，防止盯着一个账号试密码
     login_key = f'login:{_client_ip()}:{email}'
     rate_limit(login_key, LOGIN_RATE_LIMIT, "登录尝试过于频繁")
 
@@ -698,7 +667,7 @@ def login():
         cur.execute("SELECT * FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
 
-    # 统一提示，避免暴露「邮箱是否存在」
+    # 提示统一，别暴露邮箱存不存在
     if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
         raise AppError("邮箱或密码错误")
 
@@ -709,13 +678,12 @@ def login():
     return ok("登录成功", data=fmt_row(user, 'created_at'), token=token)
 
 
-# 获取活动列表
 @app.route('/api/events', methods=['GET'])
 def get_events():
     user = require_user()
     page, page_size, offset = _pagination(DEFAULT_EVENT_PAGE_SIZE)
 
-    # 可选的分类过滤：?category_id=3
+    # ?category_id= 是可选的分类过滤
     category_id = None
     raw_cat = request.args.get('category_id')
     if raw_cat:
@@ -757,8 +725,7 @@ def get_events():
             tuple(cat_params),
         )
         total = cur.fetchone()['total']
-        # 参数顺序必须与 SQL 中 %s 出现顺序一致：
-        # is_registered 的 user_id → category_id → LIMIT → OFFSET
+        # 参数顺序要和 SQL 里 %s 的顺序对上：user_id, category_id, LIMIT, OFFSET
         cur.execute(sql, (user['user_id'],) + tuple(cat_params) + (page_size, offset))
         events = cur.fetchall()
 
@@ -793,7 +760,6 @@ def get_events():
     return ok(data=events, **_page_payload(page, page_size, total))
 
 
-# 活动详情
 @app.route('/api/events/<int:event_id>', methods=['GET'])
 def get_event_detail(event_id):
     user = require_user()
@@ -836,11 +802,11 @@ def get_event_detail(event_id):
     return ok(data=event)
 
 
-# 学生报名活动（事务 + 行锁）
+# 报名：事务 + 行锁，防超卖
 @app.route('/api/register_event', methods=['POST'])
 def register_event():
     user = require_user()
-    # 只有学生账号能报名（组织者负责发布/签到，管理员负责监管）
+    # 组织者和管理员不能报名
     if user['role'] != 'student':
         raise AppError("只有学生账号可以报名活动", code=403, http_status=403)
 
@@ -850,7 +816,7 @@ def register_event():
         raise AppError("活动ID不能为空")
 
     with db_cursor(commit=True, action='报名', error_message='报名失败，请稍后重试') as cur:
-        # 锁住该活动行，容量校验与写入在同一事务内完成，避免并发超卖
+        # 锁住活动行，容量校验和写入在同一个事务里，防超卖
         event = _lock_event(cur, event_id)
         if not event:
             raise AppError("活动不存在", code=404, http_status=404)
@@ -872,7 +838,6 @@ def register_event():
     return ok(message, data={'registration_id': registration_id})
 
 
-# 获取个人报名记录
 @app.route('/api/user_registrations/<int:user_id>', methods=['GET'])
 def get_user_registrations(user_id):
     user = require_user()
@@ -912,7 +877,6 @@ def get_user_registrations(user_id):
         fmt_row(r, 'start_time', 'end_time', 'registered_at', 'check_in_time')
     return ok(data=registrations, **_page_payload(page, page_size, total))
 
-# 组织者发布活动
 @app.route('/api/create_event', methods=['POST'])
 def create_event():
     user = require_user()
@@ -936,7 +900,6 @@ def create_event():
     return ok("活动发布成功！", data={'event_id': event_id})
 
 
-# 组织者编辑活动
 @app.route('/api/update_event/<int:event_id>', methods=['PUT'])
 def update_event(event_id):
     user = require_user()
@@ -945,7 +908,7 @@ def update_event(event_id):
     with db_cursor(commit=True, action='编辑活动', error_message='保存失败，请检查填写的时间格式是否正确') as cur:
         _require_event_owner(cur, event_id, user, "无权编辑他人发布的活动")
 
-        # 先锁活动行：让后续名额校验读到最新数据，并与并发报名串行化
+        # 先锁活动行，后面的名额校验才读得到最新数据
         _lock_event(cur, event_id)
         cur.execute(
             "SELECT venue_id, start_time, end_time, "
@@ -955,18 +918,17 @@ def update_event(event_id):
         current = cur.fetchone()
         started = bool(current['started'])
 
-        # 已开始的活动不允许改开始时间，否则可以靠「把开始时间改到未来」
-        # 重新开放报名/签到，并绕过「已开始不能删除/重新开放」的保护。
+        # 开始后不能改开始时间，否则等于把报名/签到重新放开
         if started and data.get('start_time'):
             new_start = _validate_datetime(data['start_time'], '开始时间')
             if new_start != _fmt_dt(current['start_time']):
                 raise AppError("活动已开始，不能修改开始时间")
 
-        # 已开始的活动不改开始时间时，不再要求「开始时间在未来」
+        # 已经开始了，就不用再要求开始时间在未来
         fields = _validated_event_fields(cur, data, require_future=not started,
                                         exclude_event_id=event_id, current=current)
 
-        # 锁定读：避免用事务旧快照判容量，缩小名额时造成超卖
+        # 锁定读，别拿旧快照判容量
         cur.execute(
             "SELECT COUNT(*) AS cnt FROM registrations "
             "WHERE event_id = %s AND status <> 'cancelled' FOR UPDATE",
@@ -986,13 +948,12 @@ def update_event(event_id):
             (fields['title'], fields['description'], fields['venue_id'],
              fields['start_time'], fields['end_time'], fields['capacity'], event_id),
         )
-        # 只有请求里显式带上 category_ids 才更新分类（缺省表示保持不变）
+        # 只有显式传了 category_ids 才动分类
         if 'category_ids' in data:
             _apply_event_categories(cur, event_id, data['category_ids'])
     return ok("活动已更新")
 
 
-# 取消报名
 @app.route('/api/cancel_registration/<int:registration_id>', methods=['PUT'])
 def cancel_registration(registration_id):
     user = require_user()
@@ -1019,7 +980,7 @@ def cancel_registration(registration_id):
         if reg['status'] == 'cancelled':
             raise AppError("该报名已经取消过了")
         
-        # 已签到的报名是出席凭据，不能通过「取消报名」抹除
+        # 已签到是出席凭据，不能靠取消抹掉
         if reg['status'] == 'checked_in':
             raise AppError("该报名已签到，不能取消")
         
@@ -1038,17 +999,16 @@ def cancel_registration(registration_id):
     return ok("取消报名成功")
 
 
-# 删除活动
 @app.route('/api/delete_event/<int:event_id>', methods=['DELETE'])
 def delete_event(event_id):
     user = require_user()
 
     with db_cursor(commit=True, action='删除活动', error_message='删除失败，请稍后重试') as cur:
         _require_event_owner(cur, event_id, user, "无权删除他人发布的活动")
-        # 与 register_event 保持相同加锁顺序（先 events 再 registrations），避免死锁
+        # 加锁顺序和报名接口一致（先 events 后 registrations），避免死锁
         _lock_event(cur, event_id)
 
-        # 已签到 / 已开始的活动不允许普通组织者删除，防止抹掉考勤凭据
+        # 有签到或已开始的活动，普通组织者不能删
         cur.execute(
             "SELECT (NOW() > start_time) AS started, "
             "       (SELECT COUNT(*) FROM registrations "
@@ -1062,7 +1022,7 @@ def delete_event(event_id):
         if state and state['started'] and not is_admin(user):
             raise AppError("活动已开始，不能删除", code=409, http_status=409)
         
-        # 兼容旧版未加级联的库：先显式清理关联数据，再删除活动
+        # 老库可能没配级联，先手动清关联数据
         cur.execute("DELETE FROM comments WHERE event_id = %s", (event_id,))
         cur.execute("DELETE FROM event_categories WHERE event_id = %s", (event_id,))
         cur.execute("DELETE FROM registrations WHERE event_id = %s", (event_id,))
@@ -1070,14 +1030,13 @@ def delete_event(event_id):
     return ok("活动已删除")
 
 
-# 关闭 / 重新开放活动报名
 @app.route('/api/close_event/<int:event_id>', methods=['PUT'])
 def close_event(event_id):
     user = require_user()
 
     data = request.get_json(silent=True) or {}
     action = (data.get('action') or 'close').strip().lower()
-    # 兼容前端可能传 'close' / 'closed' 两种写法，避免“关闭报名”按钮直接失效
+    # 前端传过 closed，这里兼容一下
     if action == 'closed':
         action = 'close'
     if action not in ('close', 'open'):
@@ -1088,7 +1047,7 @@ def close_event(event_id):
         _require_event_owner(cur, event_id, user, "无权操作该活动")
 
         if action == 'open':
-            # 已开始 / 已结束的活动重新开放报名没有意义，也会绕过报名时间校验
+            # 开始 / 结束之后不能再开放报名
             cur.execute(
                 "SELECT (NOW() > start_time) AS started, "
                 "(end_time IS NOT NULL AND NOW() > end_time) AS ended "
@@ -1108,7 +1067,6 @@ def close_event(event_id):
     return ok("活动已关闭报名" if action == 'close' else "活动已重新开放")
 
 
-# 组织者将学生移出活动
 @app.route('/api/remove_registration/<int:registration_id>', methods=['DELETE'])
 def remove_registration(registration_id):
     user = require_user()
@@ -1131,7 +1089,7 @@ def remove_registration(registration_id):
             raise AppError("无权移除该报名", code=403, http_status=403)
         if reg['status'] == 'cancelled':
             raise AppError("该报名已经是取消状态")
-        # 已签到是出席凭据，组织者也不能通过「移出」抹掉签到记录
+        # 已签到不能移出
         if reg['status'] == 'checked_in':
             raise AppError("该学生已签到，不能移出")
 
@@ -1150,7 +1108,6 @@ def remove_registration(registration_id):
     return ok("已将该学生移出活动")
 
 
-# 获取所有场地
 @app.route('/api/venues', methods=['GET'])
 def get_venues():
     require_user()
@@ -1164,7 +1121,6 @@ def get_venues():
     return ok(data=venues)
 
 
-# 场地管理（仅管理员）：下拉框可选场地 / 增删改
 
 def _venue_fields(data):
     """校验并规整新增 / 修改场地的字段。"""
@@ -1225,7 +1181,6 @@ def _load_venue_for_update(cur, venue_id):
     return venue
 
 
-# 管理员：场地列表（含已停用的，方便启用 / 停用）
 @app.route('/api/admin/venues', methods=['GET'])
 def admin_list_venues():
     require_role('admin')
@@ -1248,7 +1203,6 @@ def admin_list_venues():
     return ok(data=venues)
 
 
-# 管理员：新增场地
 @app.route('/api/venues', methods=['POST'])
 def create_venue():
     require_role('admin')
@@ -1267,7 +1221,6 @@ def create_venue():
     return ok("场地已添加", venue_id=venue_id)
 
 
-# 管理员：修改场地
 @app.route('/api/venues/<int:venue_id>', methods=['PUT'])
 def update_venue(venue_id):
     require_role('admin')
@@ -1277,7 +1230,7 @@ def update_venue(venue_id):
         _load_venue_for_update(cur, venue_id)
         _ensure_venue_name_free(cur, fields['venue_name'], venue_id)
 
-        # 活动名额是发布时按当时容量校验的，容量不能再缩到比已有活动还小
+        # 容量不能缩到比已有活动的名额还小
         cur.execute(
             "SELECT MAX(capacity) AS max_capacity FROM events WHERE venue_id = %s",
             (venue_id,),
@@ -1298,7 +1251,7 @@ def update_venue(venue_id):
     return ok("场地已更新")
 
 
-# 管理员：删除场地（还有活动在用就不给删，避免历史活动丢失场地）
+# 管理员删场地：还有活动在用就不给删
 @app.route('/api/venues/<int:venue_id>', methods=['DELETE'])
 def delete_venue(venue_id):
     require_role('admin')
@@ -1320,7 +1273,6 @@ def delete_venue(venue_id):
     return ok("场地已删除")
 
 
-# 获取所有分类
 @app.route('/api/categories', methods=['GET'])
 def get_categories():
     require_user()
@@ -1377,7 +1329,7 @@ def check_in(registration_id):
     return ok("签到成功！")
 
 
-# 撤销签到（组织者误签时纠正）
+# 撤销签到（组织者签错了用来纠正）
 @app.route('/api/undo_check_in/<int:registration_id>', methods=['PUT'])
 def undo_check_in(registration_id):
     user = require_user()
@@ -1415,12 +1367,11 @@ def undo_check_in(registration_id):
     return ok("已撤销签到")
 
 
-# 获取活动报名名单
 @app.route('/api/event_registrations/<int:event_id>', methods=['GET'])
 def get_event_registrations(event_id):
     user = require_user()
     page, page_size, offset = _pagination(DEFAULT_LIST_PAGE_SIZE)
-    # ?include_cancelled=1 时一并返回已取消的报名记录（含取消人/取消时间，便于审计）
+    # ?include_cancelled=1 时连取消掉的报名一起返回
     include_cancelled = request.args.get('include_cancelled') in ('1', 'true', 'yes')
     status_where = '' if include_cancelled else " AND r.status <> 'cancelled'"
 
@@ -1463,7 +1414,6 @@ def get_event_registrations(event_id):
     return ok(data=registrations, **_page_payload(page, page_size, total))
 
 
-# 获取活动评论（分页）
 @app.route('/api/comments/<int:event_id>', methods=['GET'])
 def get_comments(event_id):
     require_user()
@@ -1504,7 +1454,6 @@ def get_comments(event_id):
     return ok(data=comments, **_page_payload(page, page_size, total))
 
 
-# 发表评论
 @app.route('/api/comments', methods=['POST'])
 def post_comment():
     user = require_user()
@@ -1527,7 +1476,7 @@ def post_comment():
         if not event:
             raise AppError("活动不存在", code=404, http_status=404)
 
-        # 评论 = 活动评价：只有报名过该活动的学生、活动组织者或管理员可以评论
+        # 只有报名过的学生、活动组织者和管理员能评论
         if not is_admin(user) and user['user_id'] != event['organizer_id']:
             cur.execute(
                 "SELECT 1 FROM registrations "
@@ -1544,7 +1493,6 @@ def post_comment():
     return ok("评论成功")
 
 
-# 删除评论
 @app.route('/api/delete_comment/<int:comment_id>', methods=['DELETE'])
 def delete_comment(comment_id):
     user = require_user()
@@ -1569,14 +1517,13 @@ def delete_comment(comment_id):
     return ok("评论已删除")
 
 
-# 当前登录用户信息
 @app.route('/api/me', methods=['GET'])
 def me():
     user = require_user()
     return ok(data=user)
 
 
-# 退出登录：令牌立即失效（token_version + 1，所有设备上的旧令牌一起作废）
+# 退出登录：token_version + 1，所有设备上的旧令牌一起失效
 @app.route('/api/logout', methods=['POST'])
 def logout():
     user = require_user()
@@ -1588,7 +1535,6 @@ def logout():
     return ok("已退出登录")
 
 
-# 修改密码：校验旧密码，成功后旧令牌全部失效并返回新令牌
 @app.route('/api/change_password', methods=['PUT'])
 def change_password():
     user = require_user()
@@ -1623,7 +1569,6 @@ def change_password():
     return ok("密码已修改，请使用新密码重新登录", token=issue_token(user['user_id'], new_version))
 
 
-# 管理员：查看全部用户
 @app.route('/api/admin/users', methods=['GET'])
 def admin_list_users():
     require_role('admin')
@@ -1648,7 +1593,6 @@ def admin_list_users():
     return ok(data=users, **_page_payload(page, page_size, total))
 
 
-# 管理员：把组织者设为管理员 / 把管理员降回组织者
 @app.route('/api/admin/users/<int:user_id>/role', methods=['PUT'])
 def admin_set_user_role(user_id):
     admin = require_role('admin')
@@ -1656,7 +1600,7 @@ def admin_set_user_role(user_id):
     role = (request.get_json(silent=True) or {}).get('role')
     if role not in ('organizer', 'admin'):
         raise AppError("角色只能是 organizer 或 admin")
-    # 不允许改自己：操作者本人永远留着管理员身份，系统不会变成 0 个管理员
+    # 不能改自己，这样系统里至少留一个管理员
     if user_id == admin['user_id']:
         raise AppError("不能修改自己的角色")
 
@@ -1670,7 +1614,7 @@ def admin_set_user_role(user_id):
             raise AppError("用户不存在", code=404, http_status=404)
         if target['role'] == role:
             return ok("角色未变化")
-        # 只允许组织者 <-> 管理员 之间切换，学生需要先以组织者身份注册
+        # 只允许组织者和管理员之间互相切换
         if (target['role'], role) not in (('organizer', 'admin'), ('admin', 'organizer')):
             raise AppError("学生不能直接设为管理员，请让他以组织者身份注册后再提权")
 
@@ -1680,13 +1624,11 @@ def admin_set_user_role(user_id):
     return ok(f"已把「{target['name']}」设为{label}")
 
 
-# 前端页面托管
 @app.route('/')
 def index_page():
     return send_from_directory(FRONTEND_DIR, 'login.html')
 
 
-# 统一错误响应
 @app.errorhandler(404)
 def handle_404(e):
     if request.path.startswith('/api/'):

@@ -406,7 +406,7 @@
 
 <body>
 
-<!-- 统一为所有 API 请求附带登录令牌；令牌失效自动跳回登录页 -->
+<!-- 请求统一带令牌，401 就回登录页 -->
 <script>
     (function () {
         const _fetch = window.fetch.bind(window);
@@ -571,7 +571,6 @@
             return isNaN(d.getTime()) ? null : d;
      }  
 
-        // 用户信息
         document.getElementById('user-info').innerHTML = `
             ${escapeHtml(currentUser.name)} · ${escapeHtml(currentUser.role)}
             <a href="profile.html">我的报名</a>
@@ -603,7 +602,6 @@
             });
         }
 
-        // 删除活动
         async function deleteEvent(eventId, btn) {
             const ok = await showConfirm('确定要删除这个活动吗？该操作不可恢复，所有报名记录也会被删除。');
             if (!ok) return;
@@ -663,7 +661,7 @@
             card.className = 'event-card';
 
             const isClosed = event.status === 'closed';
-            // 后端列表接口已返回 started / ended（由数据库 NOW() 计算，不信前端时钟）
+            // started / ended 用后端算好的，不信前端时钟
             const isEnded = Boolean(event.ended);
             const isStarted = Boolean(event.started) && !isEnded;
             const isOpen = !isClosed && !isStarted && !isEnded;
@@ -686,7 +684,7 @@
             else if (isStarted)    { buttonText = '活动进行中'; buttonDisabled = true; }
             else if (isRegistered) { buttonText = '已报名'; buttonDisabled = true; }
 
-            // 只有学生可以报名（组织者负责发布/签到，管理员负责监管）
+            // 只有学生能报名
             const applyBtn = currentUser.role !== 'student' ? '' : `
                 <button class="btn-apply" onclick="applyEvent(${event.event_id}, this)" ${buttonDisabled ? 'disabled' : ''}>
                     ${buttonText}
@@ -718,8 +716,7 @@
 
             const listDiv = document.getElementById('event-list');
             const moreBtn = document.getElementById('load-more-events');
-            // reset：从第 1 页重拉；more：追加下一页；
-            // refresh：保持当前页码，但把 1..N 页全部重新拉一遍（缓存完整、页码不丢）
+            // reset 从第 1 页重拉，more 追加下一页，refresh 按当前页码把已加载的重拉一遍
             const targetPage = mode === 'reset' ? 1 : (mode === 'more' ? eventPage + 1 : eventPage);
             const firstPage = mode === 'more' ? targetPage : 1;
 
@@ -762,11 +759,10 @@
         }
 
         function loadMoreEvents() {
-            // 页码在请求成功后才推进（loadEvents 内部处理），失败不会跳过一页
+            // 页码只在请求成功后推进，失败不会跳页
             loadEvents('more');
         }
 
-        // 报名
         async function applyEvent(eventId, btn) {
             if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
             const ok = await showConfirm('确定要报名参加这个活动吗？');
@@ -877,7 +873,6 @@
             }
         }
 
-        // 加载场地
         async function loadVenues() {
             try {
                 const response = await fetch('/api/venues');
@@ -1067,7 +1062,6 @@
             }
         }
 
-        // 签到
         async function checkInStudent(registrationId, btn) {
             const ok = await showConfirm('确定要为这位学生签到吗？');
             if (!ok) return;
@@ -1115,7 +1109,6 @@
             }
         }
 
-        // 删除评论
         async function deleteComment(commentId) {
             const ok = await showConfirm('确定要删除这条评论吗？');
             if (!ok) return;
@@ -1193,7 +1186,6 @@
             loadComments(currentEventId, false);
         }
 
-        // 发表评论
         async function submitComment(btn) {
             const content = document.getElementById('comment-input').value.trim();
             if (!content) { showToast('请输入评论内容'); return; }
@@ -1273,7 +1265,7 @@
             }
         }
 
-        // 角色按钮：只有组织者能提成管理员、管理员能降回组织者，学生和自己不显示
+        // 学生和自己不显示角色按钮
         function roleButton(user) {
             if (user.user_id === currentUser.user_id) {
                 return '<span style="color:#aaa; font-size:12px;">当前账号</span>';

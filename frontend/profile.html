@@ -203,7 +203,7 @@
 
 <body>
 
-<!-- 统一为所有 API 请求附带登录令牌；令牌失效自动跳回登录页 -->
+<!-- 带令牌请求，失效就跳登录 -->
 <script>
     (function () {
         const _fetch = window.fetch.bind(window);
@@ -277,7 +277,7 @@
             throw e;
         }
 
-        // HTML 转义（防 XSS）
+        // 转义一下，别把标签打进页面
         function escapeHtml(str) {
             if (str === null || str === undefined) return '';
             return String(str)
@@ -296,7 +296,7 @@
             });
         }
 
-        // Toast 提示
+        // 提示条
         function showToast(message, duration = 1800) {
             const toast = document.getElementById('toast');
             document.getElementById('toast-text').textContent = message;
@@ -304,7 +304,7 @@
             setTimeout(() => toast.classList.remove('show'), duration);
         }
 
-        // 自定义确认弹窗
+        // 确认弹窗
         let confirmResolve = null;
 
         function showConfirm(message) {
@@ -322,7 +322,7 @@
                 confirmResolve = null;
             }
         }
-        // 时间格式化工具
+        // 时间格式化（跟 index.html 一样）
         function formatDateTime(dateStr) {
             if (!dateStr) return '';
             const str = String(dateStr).replace('T', ' ');

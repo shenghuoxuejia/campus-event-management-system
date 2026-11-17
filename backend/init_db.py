@@ -28,8 +28,7 @@ SCHEMA_PATH = PROJECT_ROOT / 'database' / 'schema.sql'
 
 DB_NAME_RE = re.compile(r'^[A-Za-z0-9_]+$')
 
-# 后续版本新增的索引：(表名, 索引名, 定义)
-# init_db.py 在「库已存在」时也会幂等补齐，方便老库升级。
+# 后续版本加的索引：(表名, 索引名, 定义)，老库跑一次会自动补上
 REQUIRED_INDEXES = [
     ('events', 'idx_start_time', '(`start_time`)'),
     ('events', 'idx_events_venue_time', '(`venue_id`, `start_time`, `end_time`)'),
@@ -39,8 +38,7 @@ REQUIRED_INDEXES = [
     ('registrations', 'idx_reg_cancelled_by', '(`cancelled_by`)'),
 ]
 
-# 后续版本新增的列：(表名, 列名, 列定义)
-# 老库直接跑 init_db.py 会把这些列补上，避免应用报 1054 Unknown column。
+# 后续版本加的列：(表名, 列名, 列定义)，不补的话应用会报 1054 Unknown column
 REQUIRED_COLUMNS = [
     ('users', 'token_version', 'int NOT NULL DEFAULT 0'),
     ('registrations', 'cancelled_at', 'datetime DEFAULT NULL'),
