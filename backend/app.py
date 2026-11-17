@@ -460,6 +460,26 @@ def _get_registration_for_update(cur, user_id, event_id):
     return cur.fetchone()
 
 
+def _lock_event_of_registration(cur, registration_id):
+    """按报名记录定位活动行并加锁，返回 event_id。
+
+    全局加锁顺序统一为 events → registrations：报名接口（register_event）也是先锁
+    events 行再写 registrations。取消 / 签到 / 移出如果反过来先锁 registrations，
+    就会和报名接口形成 ABBA 死锁（MySQL 报 1213，前端只能看到 500）。
+    这里的普通 SELECT 只用来拿 event_id（不加锁、不改变快照），真正的判定在后续
+    FOR UPDATE 锁定读里做，锁定读一定读到最新已提交版本。
+    """
+    cur.execute(
+        "SELECT event_id FROM registrations WHERE registration_id = %s",
+        (registration_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise AppError("找不到该报名记录", code=404, http_status=404)
+    _lock_event(cur, row['event_id'])
+    return row['event_id']
+
+
 def _count_active_registrations(cur, event_id):
     cur.execute(
         "SELECT COUNT(*) AS cnt FROM registrations "
@@ -959,6 +979,8 @@ def cancel_registration(registration_id):
     user = require_user()
 
     with db_cursor(commit=True, action='取消报名', error_message='操作失败，请稍后重试') as cur:
+        # 先锁活动行（和报名接口同一加锁顺序），再读报名行
+        _lock_event_of_registration(cur, registration_id)
         cur.execute(
             """
             SELECT r.status, r.student_id, e.organizer_id, (NOW() > e.start_time) AS started
@@ -1072,6 +1094,8 @@ def remove_registration(registration_id):
     user = require_user()
 
     with db_cursor(commit=True, action='移除报名', error_message='操作失败，请稍后重试') as cur:
+        # 先锁活动行（和报名接口同一加锁顺序），再读报名行
+        _lock_event_of_registration(cur, registration_id)
         cur.execute(
             """
             SELECT r.status, e.organizer_id, (NOW() > e.start_time) AS started
@@ -1292,6 +1316,8 @@ def check_in(registration_id):
     user = require_user()
 
     with db_cursor(commit=True, action='签到', error_message='签到失败，请稍后重试') as cur:
+        # 先锁活动行（和报名接口同一加锁顺序），再读报名行
+        _lock_event_of_registration(cur, registration_id)
         cur.execute(
             """
             SELECT r.status, e.organizer_id,
@@ -1335,6 +1361,8 @@ def undo_check_in(registration_id):
     user = require_user()
 
     with db_cursor(commit=True, action='撤销签到', error_message='操作失败，请稍后重试') as cur:
+        # 先锁活动行（和报名接口同一加锁顺序），再读报名行
+        _lock_event_of_registration(cur, registration_id)
         cur.execute(
             """
             SELECT r.status, e.organizer_id, (e.end_time IS NOT NULL AND NOW() > e.end_time) AS ended
