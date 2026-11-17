@@ -32,7 +32,6 @@ CREATE TABLE IF NOT EXISTS `comments` (
   `created_at` datetime NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`comment_id`),
   KEY `user_id` (`user_id`),
-  KEY `idx_event` (`event_id`),
   KEY `idx_comments_event_created` (`event_id`, `created_at`),
   CONSTRAINT `comments_ibfk_1` FOREIGN KEY (`event_id`) REFERENCES `events` (`event_id`) ON DELETE CASCADE,
   CONSTRAINT `comments_ibfk_2` FOREIGN KEY (`user_id`) REFERENCES `users` (`user_id`) ON DELETE CASCADE
@@ -67,8 +66,6 @@ CREATE TABLE IF NOT EXISTS `events` (
   `status` enum('open','closed') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'open',
   `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`event_id`),
-  KEY `organizer_id` (`organizer_id`),
-  KEY `venue_id` (`venue_id`),
   KEY `idx_start_time` (`start_time`),
   KEY `idx_events_venue_time` (`venue_id`, `start_time`, `end_time`),
   KEY `idx_events_org_start` (`organizer_id`, `start_time`),
@@ -94,7 +91,6 @@ CREATE TABLE IF NOT EXISTS `registrations` (
   `updated_at`  datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`registration_id`),
   UNIQUE KEY `uk_student_event` (`student_id`,`event_id`),
-  KEY `event_id` (`event_id`),
   KEY `idx_reg_event_status` (`event_id`,`status`),
   KEY `idx_reg_cancelled_by` (`cancelled_by`),
   CONSTRAINT `registrations_ibfk_1` FOREIGN KEY (`student_id`) REFERENCES `users` (`user_id`) ON DELETE CASCADE,
@@ -139,23 +135,24 @@ CREATE TABLE IF NOT EXISTS `venues` (
 -- Dumping data for table `categories`
 --
 
+-- 种子数据用 8.0.19+ 的行别名写法（VALUES() 函数自 8.0.20 起已弃用）
 INSERT INTO `categories` (`category_name`, `description`) VALUES
 ('学术讲座','学术类讲座、报告'),
 ('文体活动','文艺、体育类活动'),
 ('志愿服务','志愿服务与社会实践'),
-('竞赛比赛','各类竞赛与比赛')
+('竞赛比赛','各类竞赛与比赛') AS new
 ON DUPLICATE KEY UPDATE
-  `description` = VALUES(`description`);
+  `description` = new.`description`;
 
 INSERT INTO `venues` (`venue_name`, `location`, `capacity`, `available_status`) VALUES
 ('大学生活动中心','校园东区',200,1),
 ('图书馆报告厅','图书馆二楼',300,1),
 ('体育馆','校园北区',500,1),
 ('教学楼A101','教学区A栋',120,1),
-('操场','校园西区',1000,1)
+('操场','校园西区',1000,1) AS new
 ON DUPLICATE KEY UPDATE
-  `location`         = VALUES(`location`),
-  `capacity`         = VALUES(`capacity`),
-  `available_status` = VALUES(`available_status`);
+  `location`         = new.`location`,
+  `capacity`         = new.`capacity`,
+  `available_status` = new.`available_status`;
 
 SET FOREIGN_KEY_CHECKS=1;

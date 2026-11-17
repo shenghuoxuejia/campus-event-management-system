@@ -144,7 +144,15 @@ def db_cursor(*, commit=False, action=None, error_message=None,
         if isinstance(err, mysql.connector.Error):
             if err.errno == 1062:
                 app.logger.warning('%s：唯一键冲突 %s', action or '数据库操作', err)
-                raise AppError(conflict_message or '数据已存在，请勿重复提交') from err
+                # 同一资源被并发重复创建，语义上是冲突（409）而不是参数错误
+                raise AppError(conflict_message or '数据已存在，请勿重复提交',
+                               code=409, http_status=409) from err
+            if err.errno in (1213, 1205):
+                # 1213 死锁 / 1205 锁等待超时：并发下的可重试冲突，不该报成 500
+                app.logger.warning('%s：并发冲突 errno=%s %s',
+                                   action or '数据库操作', err.errno, err)
+                raise AppError('当前操作过于频繁，请稍后重试',
+                               code=409, http_status=409) from err
             app.logger.exception('%s失败（数据库错误）', action or '数据库操作')
             raise AppError(error_message or '服务异常，请稍后重试',
                            code=500, http_status=500) from err
@@ -166,12 +174,6 @@ def _load_user_row(user_id, include_version=False):
     with db_cursor(action='读取用户信息') as cur:
         cur.execute(f"SELECT {columns} FROM users WHERE user_id = %s", (user_id,))
         return cur.fetchone()
-
-
-def load_user(user_id):
-    """按主键读取用户（只取安全字段，不含 token_version）。"""
-    row = _load_user_row(user_id)
-    return fmt_row(row, 'created_at') if row is not None else row
 
 
 def auth_user():
@@ -266,6 +268,22 @@ def _int_arg(name, default, *, maximum=None):
     if value < 1:
         return default
     return min(value, maximum) if maximum is not None else value
+
+
+def _int_id(value, label='ID'):
+    """把前端传来的 id 规整成正整数；list / dict / 超长串等一律 400。
+
+    不做这一步的话，非整数值会直接传给驱动，报出来是 500 而不是参数错误。
+    """
+    if isinstance(value, bool):     # bool 是 int 的子类，要先挡掉
+        raise AppError(f"{label}不合法")
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise AppError(f"{label}不合法")
+    if value <= 0:
+        raise AppError(f"{label}不合法")
+    return value
 
 
 def _pagination(default_size):
@@ -846,9 +864,7 @@ def register_event():
         raise AppError("只有学生账号可以报名活动", code=403, http_status=403)
 
     data = request.get_json(silent=True) or {}
-    event_id = data.get('event_id')
-    if not event_id:
-        raise AppError("活动ID不能为空")
+    event_id = _int_id(data.get('event_id'), '活动ID')
 
     with db_cursor(commit=True, action='报名', error_message='报名失败，请稍后重试') as cur:
         # 锁住活动行，容量校验和写入在同一个事务里，防超卖
@@ -1080,18 +1096,16 @@ def close_event(event_id):
     with db_cursor(commit=True, action='关闭/开放活动', error_message='操作失败，请稍后重试') as cur:
         _require_event_owner(cur, event_id, user, "无权操作该活动")
 
+        # 锁定读拿最新状态：“是否已开始 / 已结束”必须基于最新版本判定
+        current = _lock_event(cur, event_id)
+        if not current:
+            raise AppError("活动不存在", code=404, http_status=404)
+
         if action == 'open':
             # 开始 / 结束之后不能再开放报名
-            cur.execute(
-                "SELECT (NOW() > start_time) AS started, "
-                "(end_time IS NOT NULL AND NOW() > end_time) AS ended "
-                "FROM events WHERE event_id = %s",
-                (event_id,),
-            )
-            state = cur.fetchone()
-            if state['ended']:
+            if current['ended']:
                 raise AppError("活动已结束，无法重新开放报名")
-            if state['started']:
+            if current['started']:
                 raise AppError("活动已经开始，无法重新开放报名")
 
         cur.execute(
@@ -1499,9 +1513,9 @@ def post_comment():
     user = require_user()
 
     data = request.get_json(silent=True) or {}
-    event_id = data.get('event_id')
+    event_id = _int_id(data.get('event_id'), '活动ID')
     content = (data.get('content') or '').strip()
-    if not event_id or not content:
+    if not content:
         raise AppError("评论内容不能为空")
     if len(content) > 500:
         raise AppError("评论不能超过 500 字")
@@ -1578,6 +1592,9 @@ def logout():
 @app.route('/api/change_password', methods=['PUT'])
 def change_password():
     user = require_user()
+    # 拿到令牌后猜旧密码也是爆破面，按用户限流
+    rate_limit(f'change_password:{user["user_id"]}', LOGIN_RATE_LIMIT,
+               "操作过于频繁，请稍后再试")
     data = request.get_json(silent=True) or {}
     old_password = data.get('old_password') or ''
     new_password = data.get('new_password') or ''

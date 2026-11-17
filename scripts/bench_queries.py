@@ -120,23 +120,31 @@ QUERIES = {
 }
 
 
+# 被测索引，对照实验时通过 INVISIBLE / VISIBLE 切换
+BENCH_INDEXES = [
+    ('events', 'idx_start_time'),
+    ('events', 'idx_events_venue_time'),
+    ('events', 'idx_events_org_start'),
+    ('registrations', 'idx_reg_event_status'),
+    ('comments', 'idx_comments_event_created'),
+]
+
+
 def run_bench(conn, idx_on):
     cur = conn.cursor()
 
-    def drop_indexes():
-        cur.execute('ALTER TABLE events DROP INDEX idx_start_time, '
-                    'DROP INDEX idx_events_venue_time, DROP INDEX idx_events_org_start')
-        cur.execute('ALTER TABLE registrations DROP INDEX idx_reg_event_status')
-        cur.execute('ALTER TABLE comments DROP INDEX idx_comments_event_created')
+    def toggle_indexes(visible):
+        """把被测索引设为 INVISIBLE / VISIBLE。
 
-    # 先归零，再按需建索引（保证两组对照只差索引）
-    drop_indexes()
-    if idx_on:
-        cur.execute('ALTER TABLE events ADD INDEX idx_start_time (start_time), '
-                    'ADD INDEX idx_events_venue_time (venue_id, start_time, end_time), '
-                    'ADD INDEX idx_events_org_start (organizer_id, start_time)')
-        cur.execute('ALTER TABLE registrations ADD INDEX idx_reg_event_status (event_id, status)')
-        cur.execute('ALTER TABLE comments ADD INDEX idx_comments_event_created (event_id, created_at)')
+        用 INVISIBLE 而不是 DROP INDEX：对优化器来说等价于“没有这条索引”
+        （EXPLAIN 与耗时都能反映出来），但索引本身还在，外键要求的支撑索引
+        不会因为切换而报 1553 Cannot drop index needed in a foreign key constraint。
+        """
+        state = 'VISIBLE' if visible else 'INVISIBLE'
+        for table, index in BENCH_INDEXES:
+            cur.execute(f'ALTER TABLE `{table}` ALTER INDEX `{index}` {state}')
+
+    toggle_indexes(idx_on)
     cur.execute('ANALYZE TABLE events, registrations, comments')
     cur.fetchall()
 
