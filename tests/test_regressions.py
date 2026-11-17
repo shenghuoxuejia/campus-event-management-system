@@ -1,31 +1,12 @@
 """之前修过的 bug 的回归用例，别再改回去。"""
 
+import threading
 import uuid
 
 import app as app_module
 
-
-def _h(token):
-    return {'Authorization': f'Bearer {token}'}
-
-
-def _promote_to_admin(db, user_id):
-    db("UPDATE users SET role = 'admin' WHERE user_id = %s", (user_id,))
-
-
-def _payload(venue_id, start, end, capacity=10, title=None):
-    return {
-        'title': title or f'回归活动_{uuid.uuid4().hex[:8]}',
-        'description': '回归用例',
-        'venue_id': venue_id,
-        'start_time': start,
-        'end_time': end,
-        'capacity': capacity,
-    }
-
-
-def _detail(client, token, event_id):
-    return client.get(f'/api/events/{event_id}', headers=_h(token)).get_json()['data']
+from helpers import (auth_header, event_detail, event_payload, list_venues,
+                     post_event, promote_to_admin)
 
 
 def test_undo_check_in_success(client, auth, active_scene):
@@ -76,7 +57,7 @@ def test_can_cancel_after_undo_check_in(client, auth, active_scene, db, make_use
 
     # 活动已经开始了，学生自己取消不了，得管理员强制
     admin_user, admin_token = make_user('student')
-    _promote_to_admin(db, admin_user['user_id'])
+    promote_to_admin(db, admin_user['user_id'])
     resp = client.put(f'/api/cancel_registration/{rid}', headers=auth(admin_token))
     assert resp.status_code == 200, resp.get_json()
 
@@ -94,7 +75,7 @@ def test_remove_checked_in_student_fails(client, auth, active_scene):
 
 def test_admin_can_check_in(client, auth, active_scene, db, make_user):
     admin_user, admin_token = make_user('student')
-    _promote_to_admin(db, admin_user['user_id'])
+    promote_to_admin(db, admin_user['user_id'])
 
     resp = client.put(f"/api/check_in/{active_scene['registration_id']}",
                       headers=auth(admin_token))
@@ -103,7 +84,7 @@ def test_admin_can_check_in(client, auth, active_scene, db, make_user):
 
 def test_admin_can_cancel_registration(client, auth, registration, db, make_user):
     admin_user, admin_token = make_user('student')
-    _promote_to_admin(db, admin_user['user_id'])
+    promote_to_admin(db, admin_user['user_id'])
 
     resp = client.put(f"/api/cancel_registration/{registration['registration_id']}",
                       headers=auth(admin_token))
@@ -111,16 +92,13 @@ def test_admin_can_cancel_registration(client, auth, registration, db, make_user
 
 
 def test_cannot_book_disabled_venue(client, auth, event, db):
-    venues = client.get('/api/venues', headers=auth(event['org_token'])).get_json()['data']
+    venues = list_venues(client, event['org_token'])
     venue_id = venues[-1]['venue_id']
     db("UPDATE venues SET available_status = 0 WHERE venue_id = %s", (venue_id,))
     try:
-        resp = client.post('/api/create_event', headers=auth(event['org_token']), json={
-            'title': '停用场地活动', 'description': '',
-            'venue_id': venue_id,
-            'start_time': '2030-06-01T10:00', 'end_time': '2030-06-01T12:00',
-            'capacity': 5,
-        })
+        body = event_payload(venue_id, '2030-06-01T10:00', '2030-06-01T12:00', capacity=5,
+                             title='停用场地活动')
+        resp = client.post('/api/create_event', headers=auth(event['org_token']), json=body)
         assert resp.status_code == 400
         assert '停用' in resp.get_json()['message']
     finally:
@@ -239,8 +217,8 @@ def test_close_event_accepts_close_and_closed(client, auth, event):
 
 def test_cannot_move_start_time_of_started_event(client, auth, active_scene):
     # 把已开始活动的开始时间改到未来，等于重新开放报名/签到，必须挡住
-    detail = _detail(client, active_scene['org_token'], active_scene['event_id'])
-    payload = _payload(venue_id=detail['venue_id'],
+    detail = event_detail(client, active_scene['org_token'], active_scene['event_id'])
+    payload = event_payload(venue_id=detail['venue_id'],
                        start='2035-01-01 10:00:00',
                        end='2035-01-01 12:00:00',
                        capacity=10, title=detail['title'])
@@ -251,8 +229,8 @@ def test_cannot_move_start_time_of_started_event(client, auth, active_scene):
 
 
 def test_started_event_can_still_edit_other_fields(client, auth, active_scene):
-    detail = _detail(client, active_scene['org_token'], active_scene['event_id'])
-    payload = _payload(venue_id=detail['venue_id'],
+    detail = event_detail(client, active_scene['org_token'], active_scene['event_id'])
+    payload = event_payload(venue_id=detail['venue_id'],
                        start=detail['start_time'],
                        end=detail['end_time'],
                        capacity=max(int(detail['capacity']), 10),
@@ -262,20 +240,14 @@ def test_started_event_can_still_edit_other_fields(client, auth, active_scene):
     assert resp.status_code == 200, resp.get_json()
 
 
-def test_capacity_cannot_drop_below_active(client, auth, event, registration):
+def test_capacity_cannot_drop_below_active(client, auth, event, registration, make_user):
     for _ in range(2):
-        email = f'bulk_{uuid.uuid4().hex[:10]}@test.com'
-        client.post('/api/register', json={
-            'name': '批量学生', 'email': email,
-            'password': 'Passw0rd123', 'role': 'student',
-        })
-        token = client.post('/api/login', json={
-            'email': email, 'password': 'Passw0rd123'}).get_json()['token']
-        client.post('/api/register_event', headers=_h(token),
+        _, token = make_user('student')
+        client.post('/api/register_event', headers=auth_header(token),
                     json={'event_id': event['event_id']})
 
-    detail = _detail(client, event['org_token'], event['event_id'])
-    payload = _payload(venue_id=detail['venue_id'],
+    detail = event_detail(client, event['org_token'], event['event_id'])
+    payload = event_payload(venue_id=detail['venue_id'],
                        start=detail['start_time'],
                        end=detail['end_time'],
                        capacity=2, title=detail['title'])
@@ -306,7 +278,7 @@ def test_change_password_flow(client, make_user, auth):
         'old_password': 'Passw0rd123', 'new_password': new_password,
     })
     assert resp.status_code == 200, resp.get_json()
-    new_token = resp.get_json()['token']
+    new_token = resp.get_json()['data']['token']
     assert client.get('/api/me', headers=auth(token)).status_code == 401
     assert client.get('/api/me', headers=auth(new_token)).status_code == 200
 
@@ -505,3 +477,141 @@ def test_change_password_rate_limited(client, app, auth, make_user, monkeypatch)
     finally:
         app.config['TESTING'] = True
         _clear_buckets()
+
+
+# ---------------------------------------------------------------------------
+# 以下用例对应 2026-11 一轮代码审查修掉的问题，别再改回去
+# ---------------------------------------------------------------------------
+
+def test_removed_registration_cannot_self_re_register(client, auth, event, registration):
+    """被组织者移出后，学生不能自己重新报名，否则「移出」等于没做。"""
+    rid = registration['registration_id']
+    resp = client.delete(f'/api/remove_registration/{rid}',
+                         headers=auth(event['org_token']))
+    assert resp.status_code == 200, resp.get_json()
+
+    again = client.post('/api/register_event', headers=auth(registration['stu_token']),
+                        json={'event_id': event['event_id']})
+    assert again.status_code == 403, again.get_json()
+    assert '移出' in again.get_json()['message']
+
+    with app_module.db_cursor() as cur:
+        cur.execute("SELECT status, cancelled_by FROM registrations "
+                    "WHERE registration_id = %s", (rid,))
+        row = cur.fetchone()
+    assert row['status'] == 'cancelled'
+    assert row['cancelled_by'] == event['organizer']['user_id']
+
+
+def test_capacity_out_of_range_is_400_not_500(client, auth, event, unique_event_window):
+    """容量超出上限（否则 MySQL 报 1264）要是参数错误，不是 500。"""
+    venue_id = list_venues(client, event['org_token'])[0]['venue_id']
+    start, end = unique_event_window()
+    body = event_payload(venue_id, start, end, capacity=99999999999, title='超大名额')
+    resp = client.post('/api/create_event', headers=auth(event['org_token']), json=body)
+    assert resp.status_code == 400, resp.get_json()
+    assert '名额' in resp.get_json()['message']
+
+
+def test_venue_capacity_out_of_range_is_400(client, make_user, auth, db):
+    _, token = make_user('student')
+    uid = client.get('/api/me', headers=auth(token)).get_json()['data']['user_id']
+    promote_to_admin(db, uid)
+
+    resp = client.post('/api/venues', headers=auth(token), json={
+        'venue_name': f'超大场地_{uuid.uuid4().hex[:8]}', 'capacity': 99999999999,
+    })
+    assert resp.status_code == 400, resp.get_json()
+    assert '容量' in resp.get_json()['message']
+
+
+def test_response_envelope_keeps_token_and_id_inside_data(client, make_user, auth, db):
+    """统一响应结构：令牌这类附加字段放在 data 里，不要平铺到顶层。"""
+    email = f'envelope_{uuid.uuid4().hex[:8]}@test.com'
+
+    body = client.post('/api/register', json={
+        'name': '结构校验', 'email': email, 'password': 'Passw0rd123', 'role': 'student',
+    }).get_json()
+    assert set(body) <= {'code', 'message', 'data'}, body
+    assert body['data']['token']
+
+    body = client.post('/api/login', json={'email': email, 'password': 'Passw0rd123'}).get_json()
+    assert set(body) <= {'code', 'message', 'data'}, body
+    token = body['data']['token']
+    assert token
+
+    body = client.put('/api/change_password', headers=auth(token), json={
+        'old_password': 'Passw0rd123', 'new_password': 'Passw0rd456',
+    }).get_json()
+    assert set(body) <= {'code', 'message', 'data'}, body
+    assert body['data']['token']
+
+    # 新增场地返回的 venue_id 同样在 data 里
+    uid = client.get('/api/me', headers=auth(body['data']['token'])).get_json()['data']['user_id']
+    promote_to_admin(db, uid)
+    body = client.post('/api/venues', headers=auth(body['data']['token']), json={
+        'venue_name': f'结构校验场地_{uuid.uuid4().hex[:8]}', 'capacity': 10,
+    }).get_json()
+    assert set(body) <= {'code', 'message', 'data'}, body
+    assert body['data']['venue_id']
+
+
+def test_update_event_can_move_to_another_venue(client, auth, event, unique_event_window):
+    """编辑换场地要走得通：场地锁改到活动行之前拿，别把功能弄坏。"""
+    detail = event_detail(client, event['org_token'], event['event_id'])
+    others = [v for v in list_venues(client, event['org_token'])
+              if v['venue_id'] != detail['venue_id']]
+    if not others:
+        return  # 测试库只有一个场地，跳过
+
+    start, end = unique_event_window()
+    body = event_payload(others[0]['venue_id'], start, end,
+                         capacity=detail['capacity'], title='换场地后的活动')
+    resp = client.put(f"/api/update_event/{event['event_id']}",
+                      headers=auth(event['org_token']), json=body)
+    assert resp.status_code == 200, resp.get_json()
+    assert event_detail(client, event['org_token'], event['event_id'])['venue_id'] == others[0]['venue_id']
+
+
+def test_create_and_update_same_venue_do_not_deadlock(app, client, make_user,
+                                                      unique_event_window):
+    """发布和编辑都按 venues → events 加锁；反过来会 1213（表现为 409）。"""
+    _, org_token = make_user('organizer')
+    venues = list_venues(client, org_token)
+    venue_id = venues[0]['venue_id']
+
+    start, end = unique_event_window()
+    event_id = post_event(client, org_token, event_payload(
+        venue_id, start, end, capacity=5, title='锁顺序测试活动'))
+
+    for round_no in range(3):
+        create_start, create_end = unique_event_window()
+        update_start, update_end = unique_event_window()
+        create_body = event_payload(venue_id, create_start, create_end,
+                                    capacity=5, title=f'并发发布_{round_no}')
+        update_body = event_payload(venue_id, update_start, update_end,
+                                    capacity=5, title=f'并发编辑_{round_no}')
+
+        barrier = threading.Barrier(2)
+        results = []
+
+        def do_create():
+            with app.test_client() as c:
+                barrier.wait()
+                r = c.post('/api/create_event', headers=auth_header(org_token), json=create_body)
+                results.append(('create', r.status_code, r.get_json().get('message', '')))
+
+        def do_update():
+            with app.test_client() as c:
+                barrier.wait()
+                r = c.put(f'/api/update_event/{event_id}', headers=auth_header(org_token),
+                          json=update_body)
+                results.append(('update', r.status_code, r.get_json().get('message', '')))
+
+        threads = [threading.Thread(target=do_create), threading.Thread(target=do_update)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert sorted(code for _, code, _ in results) == [200, 200], f'第 {round_no} 轮 {results}'

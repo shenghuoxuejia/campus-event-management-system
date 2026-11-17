@@ -8,22 +8,15 @@
 
 import pytest
 
-import app as app_module
 from app import AppError
 
-
-def _h(token):
-    return {'Authorization': f'Bearer {token}'}
-
-
-def _venue_with_capacity(client, auth, token, capacity):
-    venues = client.get('/api/venues', headers=auth(token)).get_json()['data']
-    return next(v for v in venues if v['capacity'] >= capacity)
+from helpers import promote_to_admin, venue_with_capacity
 
 
 # ---------- 视图 ----------
 
-def test_view_counts_match_registrations(client, auth, event, registration, db_fetch, db):
+def test_view_counts_match_registrations(client, auth, event, registration, db_fetch,
+                                         db, make_user):
     """v_event_overview 的 registered_count / remaining 必须和明细表一致。"""
     eid = event['event_id']
 
@@ -36,7 +29,7 @@ def test_view_counts_match_registrations(client, auth, event, registration, db_f
     assert row['checked_in_count'] == 0
 
     # 再报一个人，视图要跟着变
-    _, other_token = _make_student(client)
+    _, other_token = make_user('student')
     resp = client.post('/api/register_event', headers=auth(other_token),
                        json={'event_id': eid})
     assert resp.status_code == 200, resp.get_json()
@@ -72,22 +65,12 @@ def test_list_endpoint_exposes_counts(client, auth, event, registration):
     assert isinstance(row['remaining'], int)
 
 
-def _make_student(client):
-    import uuid
-    email = f'student_{uuid.uuid4().hex[:12]}@test.com'
-    client.post('/api/register', json={'name': '学生', 'email': email,
-                                       'password': 'Passw0rd123', 'role': 'student'})
-    login = client.post('/api/login', json={'email': email, 'password': 'Passw0rd123'})
-    data = login.get_json()
-    return data['data'], data['token']
-
-
 # ---------- 触发器：绕过接口直接写库也要被拦住 ----------
 
 def test_trigger_blocks_overlapping_venue_insert(client, auth, make_user, db, unique_event_window):
     """应用层校验被绕过时（直接 INSERT），数据库触发器必须拦住场地重叠。"""
     org_user, org_token = make_user('organizer')
-    venue = _venue_with_capacity(client, auth, org_token, 100)
+    venue = venue_with_capacity(client, org_token, 100)
     start, end = unique_event_window()
 
     db("INSERT INTO events (title, description, organizer_id, venue_id, "
@@ -106,7 +89,7 @@ def test_trigger_blocks_overlapping_venue_insert(client, auth, make_user, db, un
 def test_trigger_allows_adjacent_venue_insert(client, auth, make_user, db, unique_event_window):
     """首尾相接不算重叠，触发器不能误伤。"""
     org_user, org_token = make_user('organizer')
-    venue = _venue_with_capacity(client, auth, org_token, 100)
+    venue = venue_with_capacity(client, org_token, 100)
     start, end = unique_event_window()
 
     db("INSERT INTO events (title, description, organizer_id, venue_id, "
@@ -124,7 +107,7 @@ def test_trigger_allows_adjacent_venue_insert(client, auth, make_user, db, uniqu
 def test_trigger_blocks_capacity_over_venue(client, auth, make_user, db, unique_event_window):
     """名额超过场地容量：直接写库也要被拦（应用层之外的第二道）。"""
     org_user, org_token = make_user('organizer')
-    venue = _venue_with_capacity(client, auth, org_token, 100)
+    venue = venue_with_capacity(client, org_token, 100)
     start, end = unique_event_window()
 
     with pytest.raises(AppError) as err:
@@ -177,13 +160,14 @@ def test_event_stats_missing_event_404(client, auth, event):
     assert resp.status_code == 404
 
 
-def test_event_stats_matches_database(client, auth, active_scene, db, db_fetch):
+def test_event_stats_matches_database(client, auth, active_scene, db, db_fetch,
+                                      make_user):
     """存储过程算的出入率要和库里数据对得上（用进行中的活动才能签到）。"""
     eid = active_scene['event_id']
 
     # 已有 1 个报名（active_scene 夹具造的）。活动已开始，接口不允许再报名了，
     # 所以第二个报名直接写库（触发器允许 status='registered' 且时间戳为空）
-    other_user, _ = _make_student(client)
+    other_user, _ = make_user('student')
     db("INSERT INTO registrations (student_id, event_id, status) "
        "VALUES (%s, %s, 'registered')", (other_user['user_id'], eid))
 
@@ -220,7 +204,7 @@ def test_event_stats_after_cancel(client, auth, event, registration, db_fetch):
 
 def test_event_stats_admin_allowed(client, auth, event, make_user, db):
     admin_user, admin_token = make_user('student')
-    db("UPDATE users SET role = 'admin' WHERE user_id = %s", (admin_user['user_id'],))
+    promote_to_admin(db, admin_user['user_id'])
     resp = client.get(f"/api/events/{event['event_id']}/stats", headers=auth(admin_token))
     assert resp.status_code == 200, resp.get_json()
 
@@ -240,7 +224,7 @@ def test_admin_stats_requires_login(client):
 
 def test_admin_stats_aggregates(client, auth, event, registration, make_user, db, db_fetch):
     admin_user, admin_token = make_user('student')
-    db("UPDATE users SET role = 'admin' WHERE user_id = %s", (admin_user['user_id'],))
+    promote_to_admin(db, admin_user['user_id'])
 
     resp = client.get('/api/admin/stats', headers=auth(admin_token))
     assert resp.status_code == 200, resp.get_json()

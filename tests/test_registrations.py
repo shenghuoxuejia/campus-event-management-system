@@ -3,23 +3,8 @@
 import threading
 import uuid
 
-
-def _h(token):
-    return {'Authorization': f'Bearer {token}'}
-
-
-def _create_event(client, token, venue_id, window):
-    start, end = window
-    resp = client.post('/api/create_event', headers=_h(token), json={
-        'title': f'分页测试_{uuid.uuid4().hex[:8]}',
-        'description': '',
-        'venue_id': venue_id,
-        'start_time': start,
-        'end_time': end,
-        'capacity': 5,
-    })
-    assert resp.status_code == 200, resp.get_json()
-    return resp.get_json()['data']['event_id']
+from helpers import (auth_header, create_event, event_payload, list_venues,
+                     post_event, promote_to_admin)
 
 
 OVERSOLD_ROUNDS = 8
@@ -35,20 +20,14 @@ def test_no_oversell(app, client, make_user, unique_event_window, db_fetch):
     _, tok_a = make_user('student')
     _, tok_b = make_user('student')
 
-    venues = client.get('/api/venues', headers=_h(org_token)).get_json()['data']
+    venues = list_venues(client, org_token)
 
     for round_no in range(OVERSOLD_ROUNDS):
         start, end = unique_event_window()
-        resp = client.post('/api/create_event', headers=_h(org_token), json={
-            'title': f'并发测试活动_{round_no}_{uuid.uuid4().hex[:8]}',
-            'description': '容量 1',
-            'venue_id': venues[0]['venue_id'],
-            'start_time': start,
-            'end_time': end,
-            'capacity': 1,
-        })
-        assert resp.status_code == 200, resp.get_json()
-        event_id = resp.get_json()['data']['event_id']
+        body = event_payload(venues[0]['venue_id'], start, end, capacity=1,
+                             title=f'并发测试活动_{round_no}_{uuid.uuid4().hex[:8]}',
+                             description='容量 1')
+        event_id = post_event(client, org_token, body)
 
         barrier = threading.Barrier(2)
         results = []
@@ -57,7 +36,7 @@ def test_no_oversell(app, client, make_user, unique_event_window, db_fetch):
             # 线程之间不能共用 test_client
             with app.test_client() as c:
                 barrier.wait()          # 两个请求卡在起跑线上
-                r = c.post('/api/register_event', headers=_h(token),
+                r = c.post('/api/register_event', headers=auth_header(token),
                            json={'event_id': event_id})
                 results.append((r.status_code, r.get_json().get('message', '')))
 
@@ -190,11 +169,12 @@ def test_check_in_by_non_organizer_forbidden(client, auth, event, registration, 
 def test_my_registrations_pagination_meta(client, auth, make_user, unique_event_window):
     _, org_token = make_user('organizer')
     stu_user, stu_token = make_user('student')
-    venues = client.get('/api/venues', headers=auth(org_token)).get_json()['data']
+    venues = list_venues(client, org_token)
 
     event_ids = []
     for _ in range(3):
-        eid = _create_event(client, org_token, venues[0]['venue_id'], unique_event_window())
+        eid = create_event(client, org_token, venues[0]['venue_id'],
+                       unique_event_window(), capacity=5)
         event_ids.append(eid)
         r = client.post('/api/register_event', headers=auth(stu_token),
                         json={'event_id': eid})
@@ -393,7 +373,7 @@ def test_admin_can_delete_any_comment(client, auth, event, registration,
     cid = _comment_ids(db_fetch, event['event_id'])[0]
 
     admin_user, admin_token = make_user('student')
-    db("UPDATE users SET role = 'admin' WHERE user_id = %s", (admin_user['user_id'],))
+    promote_to_admin(db, admin_user['user_id'])
 
     resp = client.delete(f'/api/delete_comment/{cid}', headers=auth(admin_token))
     assert resp.status_code == 200, resp.get_json()

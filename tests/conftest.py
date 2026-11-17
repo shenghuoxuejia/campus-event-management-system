@@ -10,7 +10,10 @@ from datetime import datetime, timedelta
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / 'backend'))
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 
 try:
     from dotenv import load_dotenv
@@ -19,6 +22,8 @@ except ImportError:
     pass
 
 import app as app_module
+
+from helpers import create_event, find_event_in_list, list_venues
 
 TEST_DB_NAME = os.environ.get('TEST_DB_NAME', 'campus_events_test')
 DEV_DB_NAME = os.environ.get('DB_NAME', 'campus_events')
@@ -141,7 +146,9 @@ def make_user(client):
         assert resp.status_code == 200, resp.get_json()
         login = client.post('/api/login', json={'email': email, 'password': password})
         assert login.status_code == 200, login.get_json()
-        return login.get_json()['data'], login.get_json()['token']
+        body = login.get_json()
+        # 令牌统一放在 data.token 里（和 {code,message,data} 的约定一致）
+        return body['data'], body['data']['token']
 
     return _make
 
@@ -175,23 +182,12 @@ def db_fetch():
 @pytest.fixture()
 def event(client, make_user, auth):
     org_user, org_token = make_user('organizer')
-    venues = client.get('/api/venues', headers=auth(org_token)).get_json()['data']
+    venues = list_venues(client, org_token)
     assert venues, '库里没有场地，先跑 init_db.py 灌种子数据'
     venue_id = venues[uuid.uuid4().int % len(venues)]['venue_id']
 
-    start, end = unique_window()
-    resp = client.post('/api/create_event', headers=auth(org_token), json={
-        'title': f'测试活动_{uuid.uuid4().hex[:8]}',
-        'description': '测试用活动',
-        'venue_id': venue_id,
-        'start_time': start,
-        'end_time': end,
-        'capacity': 10,
-    })
-    assert resp.status_code == 200, resp.get_json()
-
-    return {'organizer': org_user, 'org_token': org_token,
-            'event_id': resp.get_json()['data']['event_id']}
+    event_id = create_event(client, org_token, venue_id, unique_window(), capacity=10)
+    return {'organizer': org_user, 'org_token': org_token, 'event_id': event_id}
 
 
 @pytest.fixture()
@@ -240,15 +236,6 @@ def ended_scene(client, make_user, auth, event, db, db_fetch):
 def find_event(client, auth):
     # 活动列表分页，目标活动不一定在第一页，得翻
     def _find(token, event_id, page_size=100):
-        page = 1
-        while True:
-            result = client.get(
-                f'/api/events?page={page}&page_size={page_size}', headers=auth(token)
-            ).get_json()
-            for e in result['data']:
-                if e['event_id'] == event_id:
-                    return e
-            if page >= result['pages']:
-                return None
-            page += 1
+        return find_event_in_list(client, token, event_id, page_size)
+
     return _find

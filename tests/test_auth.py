@@ -16,12 +16,12 @@ def test_register_returns_token_and_logs_in(client, role):
     })
     assert resp.status_code == 200
     body = resp.get_json()
-    assert body['token']
+    assert body['data']['token']
     assert body['data']['email'] == email
     assert body['data']['role'] == role
     assert 'password_hash' not in body['data']
 
-    me = client.get('/api/me', headers={'Authorization': f"Bearer {body['token']}"})
+    me = client.get('/api/me', headers={'Authorization': f"Bearer {body['data']['token']}"})
     assert me.status_code == 200
     assert me.get_json()['data']['email'] == email
 

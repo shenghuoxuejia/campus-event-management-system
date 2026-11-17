@@ -4,12 +4,14 @@ import uuid
 
 import pytest
 
+from helpers import event_payload, promote_to_admin
+
 
 @pytest.fixture()
 def admin(client, auth, make_user, db):
     # 注册接口不让自助申请 admin，只能在库里提
     user, token = make_user('student')
-    db("UPDATE users SET role = 'admin' WHERE user_id = %s", (user['user_id'],))
+    promote_to_admin(db, user['user_id'])
     return user, auth(token)
 
 
@@ -23,7 +25,7 @@ def new_venue(client, admin, db):
             'venue_name': name, 'location': location, 'capacity': capacity,
         })
         assert resp.status_code == 200, resp.get_json()
-        venue_id = resp.get_json()['venue_id']
+        venue_id = resp.get_json()['data']['venue_id']
         created.append(venue_id)
         return {'venue_id': venue_id, 'venue_name': name, 'capacity': capacity}
 
@@ -205,14 +207,9 @@ def test_capacity_cannot_shrink_below_existing_event(client, admin, new_venue,
     venue = new_venue(capacity=100)
     _, org_token = make_user('organizer')
     start, end = unique_event_window()
+    body = event_payload(venue['venue_id'], start, end, capacity=30, title='容量校验用活动')
     create = client.post('/api/create_event',
-                         headers={'Authorization': f'Bearer {org_token}'}, json={
-                             'title': '容量校验用活动',
-                             'venue_id': venue['venue_id'],
-                             'start_time': start,
-                             'end_time': end,
-                             'capacity': 30,
-                         })
+                         headers={'Authorization': f'Bearer {org_token}'}, json=body)
     assert create.status_code == 200, create.get_json()
 
     resp = client.put(f"/api/venues/{venue['venue_id']}", headers=admin[1], json={
@@ -242,14 +239,9 @@ def test_disable_venue_hides_it_from_event_form(client, admin, new_venue,
 
     _, org_token = make_user('organizer')
     start, end = unique_event_window()
+    body = event_payload(venue['venue_id'], start, end, capacity=10, title='停用场地发布')
     create = client.post('/api/create_event', headers={'Authorization': f'Bearer {org_token}'},
-                         json={
-                             'title': '停用场地发布',
-                             'venue_id': venue['venue_id'],
-                             'start_time': start,
-                             'end_time': end,
-                             'capacity': 10,
-                         })
+                         json=body)
     assert create.status_code == 400
     assert '不存在或已停用' in create.get_json()['message']
 
@@ -259,14 +251,9 @@ def test_delete_venue_in_use_returns_409(client, admin, new_venue, make_user,
     venue = new_venue()
     _, org_token = make_user('organizer')
     start, end = unique_event_window()
+    body = event_payload(venue['venue_id'], start, end, capacity=10, title='占用场地的活动')
     create = client.post('/api/create_event', headers={'Authorization': f'Bearer {org_token}'},
-                         json={
-                             'title': '占用场地的活动',
-                             'venue_id': venue['venue_id'],
-                             'start_time': start,
-                             'end_time': end,
-                             'capacity': 10,
-                         })
+                         json=body)
     assert create.status_code == 200, create.get_json()
 
     resp = client.delete(f"/api/venues/{venue['venue_id']}", headers=admin[1])

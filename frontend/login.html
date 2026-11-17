@@ -271,9 +271,10 @@
             });
             const data = await response.json();
             if (data.code === 200) {
-                // 注册接口直接给令牌，这里当登录用
-                localStorage.setItem('user', JSON.stringify(data.data));
-                localStorage.setItem('token', data.token);
+                // 注册接口直接给令牌，这里当登录用；令牌统一在 data.token 里
+                const { token, ...profile } = data.data || {};
+                localStorage.setItem('user', JSON.stringify(profile));
+                localStorage.setItem('token', token);
                 showToast('注册成功，正在进入...');
                 setTimeout(() => {
                     window.location.href = 'index.html';
@@ -301,8 +302,10 @@
             });
             const data = await response.json();
             if (data.code === 200) {
-                localStorage.setItem('user', JSON.stringify(data.data));
-                localStorage.setItem('token', data.token);
+                // 令牌统一在 data.token 里
+                const { token, ...profile } = data.data || {};
+                localStorage.setItem('user', JSON.stringify(profile));
+                localStorage.setItem('token', token);
                 showToast('登录成功，正在跳转...');
                 setTimeout(() => {
                     window.location.href = 'index.html';

@@ -456,7 +456,7 @@
                 if (data.code === 200) {
                     showToast(data.message);
                     // 旧令牌已失效，直接用返回的新令牌续上，或重新登录
-                    if (data.token) localStorage.setItem('token', data.token);
+                    if (data.data && data.data.token) localStorage.setItem('token', data.data.token);
                     document.getElementById('old-password').value = '';
                     document.getElementById('new-password').value = '';
                 } else {

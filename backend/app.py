@@ -63,6 +63,8 @@ if os.environ.get('DB_PASSWORD') and '在这里填' in os.environ['DB_PASSWORD']
 
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 ALLOWED_REGISTER_ROLES = ('student', 'organizer')       # 不允许自助注册 admin
+# 名额 / 场地容量的上限：挡住 99999999999 这类整型溢出（MySQL 报 1264）
+MAX_CAPACITY = 100000
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 app.config['SECRET_KEY'] = APP_SECRET_KEY
@@ -159,6 +161,13 @@ def db_cursor(*, commit=False, action=None, error_message=None,
                                    action or '数据库操作', err.errno, err)
                 raise AppError('当前操作过于频繁，请稍后重试',
                                code=409, http_status=409) from err
+            if err.errno in (1264, 1406, 1452):
+                # 1264 超出字段范围 / 1406 数据过长 / 1452 外键目标不存在：
+                # 都是入参问题，映射成 400，别让前端把用户输错的内容当成服务端故障
+                app.logger.warning('%s：入参超出数据库限制 errno=%s %s',
+                                   action or '数据库操作', err.errno, err)
+                raise AppError('提交的数据超出允许范围，请检查长度和数值',
+                               code=400, http_status=400) from err
             app.logger.exception('%s失败（数据库错误）', action or '数据库操作')
             raise AppError(error_message or '服务异常，请稍后重试',
                            code=500, http_status=500) from err
@@ -445,6 +454,25 @@ def _get_venue(cur, venue_id, *, allow_inactive=False):
     return venue
 
 
+def _lock_venues(cur, venue_ids):
+    """按 venue_id 升序批量锁定场地行，返回 {venue_id: 行}。仅返回存在的场地。
+
+    全局加锁顺序统一为 venues → events：发布和编辑活动都必须先锁场地、再锁活动行。
+    编辑如果先锁 events 再锁 venues，和「发布同场地活动」并发时就是反向加锁，
+    MySQL 会报 1213。多个场地按主键升序获取，避免两个事务互换场地时互相等待。
+    """
+    ids = sorted({int(v) for v in venue_ids if v not in (None, '')})
+    if not ids:
+        return {}
+    placeholders = ','.join(['%s'] * len(ids))
+    cur.execute(
+        "SELECT venue_id, venue_name, capacity, available_status FROM venues "
+        f"WHERE venue_id IN ({placeholders}) ORDER BY venue_id ASC FOR UPDATE",
+        tuple(ids),
+    )
+    return {row['venue_id']: row for row in cur.fetchall()}
+
+
 def _fmt_dt(value):
     """把 datetime / 字符串统一成 'YYYY-MM-DD HH:MM:SS' 便于比较。"""
     if value is None:
@@ -474,7 +502,9 @@ def _is_start_in_future(cur, start):
 
 def _require_event_owner(cur, event_id, user, deny_message="无权操作该活动"):
     """校验当前用户是否为活动组织者（管理员放行）；是则返回活动行，否则抛 AppError。"""
-    cur.execute("SELECT organizer_id FROM events WHERE event_id = %s", (event_id,))
+    cur.execute(
+        "SELECT organizer_id, venue_id FROM events WHERE event_id = %s", (event_id,)
+    )
     event = cur.fetchone()
     if not event:
         raise AppError("活动不存在", code=404, http_status=404)
@@ -503,8 +533,9 @@ def _lock_event(cur, event_id):
 
 
 def _get_registration_for_update(cur, user_id, event_id):
+    # cancelled_by 用来区分「学生自己取消」和「被组织者移出」：后者不允许自己复活
     cur.execute(
-        "SELECT registration_id, status FROM registrations "
+        "SELECT registration_id, status, cancelled_by FROM registrations "
         "WHERE student_id = %s AND event_id = %s FOR UPDATE",
         (user_id, event_id),
     )
@@ -561,7 +592,8 @@ def _upsert_registration(cur, existing, user_id, event_id):
     return "报名成功！", cur.lastrowid
 
 
-def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=None, current=None):
+def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=None,
+                            current=None, venue=None):
     """校验并规整发布 / 编辑活动的字段，通过就返回能直接入库的 dict。"""
     title = (data.get('title') or '').strip()
     description = (data.get('description') or '').strip()
@@ -585,10 +617,16 @@ def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=
         raise AppError("名额必须是整数")
     if capacity <= 0:
         raise AppError("名额必须大于 0")
+    if capacity > MAX_CAPACITY:
+        raise AppError(f"名额不能超过 {MAX_CAPACITY}")
 
-    venue = _get_venue(cur, venue_id,
-                       allow_inactive=bool(current and str(venue_id) == str(current.get('venue_id'))))
-    if not venue:
+    allow_inactive = bool(current and str(venue_id) == str(current.get('venue_id')))
+    if venue is None:
+        venue = _get_venue(cur, venue_id, allow_inactive=allow_inactive)
+        if not venue:
+            raise AppError("所选场地不存在或已停用")
+    elif not allow_inactive and not int(venue.get('available_status') or 0):
+        # 场地行已由调用方按统一加锁顺序锁好，这里只复核它是不是停用状态
         raise AppError("所选场地不存在或已停用")
     if venue['capacity'] is not None and capacity > venue['capacity']:
         raise AppError(f"名额超过了场地容量（{venue['capacity']}）")
@@ -719,7 +757,7 @@ def register():
 
     # 注册完直接发令牌，前端不用再登一次
     token = issue_token(user['user_id'], 0)
-    return ok("注册成功，已自动登录", data=fmt_row(user, 'created_at'), token=token)
+    return ok("注册成功，已自动登录", data={**fmt_row(user, 'created_at'), 'token': token})
 
 
 @app.route('/api/login', methods=['POST'])
@@ -747,7 +785,7 @@ def login():
     user.pop('password_hash', None)
     user.pop('token_version', None)
     reset_rate_limit(login_key)
-    return ok("登录成功", data=fmt_row(user, 'created_at'), token=token)
+    return ok("登录成功", data={**fmt_row(user, 'created_at'), 'token': token})
 
 
 @app.route('/api/events', methods=['GET'])
@@ -934,6 +972,9 @@ def register_event():
         existing = _get_registration_for_update(cur, user['user_id'], event_id)
         if existing and existing['status'] != 'cancelled':
             raise AppError("你已经报名过该活动了，请勿重复报名")
+        # 被组织者移出的报名不能自己复活，否则「移出」形同虚设
+        if existing and existing.get('cancelled_by') not in (None, user['user_id']):
+            raise AppError("你已被组织者移出该活动，无法再次报名", code=403, http_status=403)
 
         if _count_active_registrations(cur, event_id) >= (event['capacity'] or 0):
             raise AppError("活动名额已满，报名失败")
@@ -1010,7 +1051,13 @@ def update_event(event_id):
 
     data = request.get_json(silent=True) or {}
     with db_cursor(commit=True, action='编辑活动', error_message='保存失败，请检查填写的时间格式是否正确') as cur:
-        _require_event_owner(cur, event_id, user, "无权编辑他人发布的活动")
+        owned = _require_event_owner(cur, event_id, user, "无权编辑他人发布的活动")
+
+        # 全局加锁顺序统一为 venues → events：先把「原场地」和「目标场地」按主键升序
+        # 一起锁住，再锁活动行。反过来（先锁 events 再锁 venues）会和发布活动并发时
+        # 反向加锁，MySQL 报 1213 死锁。
+        wanted_venue_id = _int_id(data.get('venue_id') or owned['venue_id'], '场地ID')
+        locked_venues = _lock_venues(cur, (owned['venue_id'], wanted_venue_id))
 
         # 先锁活动行：锁定读读的是最新已提交版本，后面的 started / 名额 / 时间
         # 判定全部用这一行，不再另发普通 SELECT（它拿到的会是本事务的旧快照）
@@ -1027,7 +1074,8 @@ def update_event(event_id):
 
         # 已经开始了，就不用再要求开始时间在未来
         fields = _validated_event_fields(cur, data, require_future=not started,
-                                        exclude_event_id=event_id, current=current)
+                                        exclude_event_id=event_id, current=current,
+                                        venue=locked_venues.get(wanted_venue_id))
 
         # 锁定读，别拿旧快照判容量
         cur.execute(
@@ -1246,6 +1294,8 @@ def _venue_fields(data):
         raise AppError("场地容量必须是整数")
     if capacity <= 0:
         raise AppError("场地容量必须大于 0")
+    if capacity > MAX_CAPACITY:
+        raise AppError(f"场地容量不能超过 {MAX_CAPACITY}")
 
     if isinstance(available, bool):
         available = int(available)
@@ -1322,7 +1372,7 @@ def create_venue():
         )
         venue_id = cur.lastrowid
 
-    return ok("场地已添加", venue_id=venue_id)
+    return ok("场地已添加", data={'venue_id': venue_id})
 
 
 @app.route('/api/venues/<int:venue_id>', methods=['PUT'])
@@ -1677,7 +1727,8 @@ def change_password():
             (hashed, user['user_id']),
         )
         new_version = int(row['token_version'] or 0) + 1
-    return ok("密码已修改，请使用新密码重新登录", token=issue_token(user['user_id'], new_version))
+    return ok("密码已修改，请使用新密码重新登录",
+              data={'token': issue_token(user['user_id'], new_version)})
 
 
 @app.route('/api/admin/stats', methods=['GET'])
