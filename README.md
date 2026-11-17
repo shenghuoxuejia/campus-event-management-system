@@ -37,7 +37,7 @@
 
 ## 功能特性
 
-- **双角色自助注册**：学生报名活动；组织者发布 / 编辑活动、负责签到与报名管理。
+- **双角色自助注册**：学生报名活动；组织者发布 / 编辑活动、负责签到与报名管理。注册成功后直接登录（接口返回令牌，不用再输一遍密码）。
 - **认证与安全**：登录签发 `Bearer Token`，服务端从令牌解析身份，不信任前端传来的用户标识；支持退出登录（令牌立即吊销）与修改密码。
 - **并发安全报名**：事务 + 行锁（`SELECT ... FOR UPDATE`）防止名额超卖。
 - **完整业务闭环**：发布 → 报名 → 签到 → 评论 → 取消 / 重新报名，覆盖活动全生命周期。
@@ -67,23 +67,20 @@ CampusEventProject-fixed/
 ├── backend/                     # 后端（Flask 应用 + 数据库运维脚本）
 │   ├── app.py                   # 主程序：路由、认证、限流、事务与锁逻辑
 │   ├── init_db.py               # 建库建表 + 老库幂等升级（--force 删表重建）
-│   ├── make_admin.py            # 把已有账号提升为管理员
-│   ├── seed_demo.py             # 一键写入演示数据
+│   ├── make_admin.py            # 创建管理员 / 把已有账号提升为管理员
 │   └── setup_env.py             # 交互式生成 .env
 ├── frontend/                    # 前端静态页（由 Flask 托管，无需单独起服务）
 │   ├── login.html               # 登录 / 注册页
-│   ├── index.html               # 活动大厅（发布、报名、签到、评论、分类筛选）
+│   ├── index.html               # 活动大厅（发布、报名、签到、评论、分类筛选、场地管理）
 │   └── profile.html             # 个人中心（我的报名、取消报名、修改密码）
 ├── database/
 │   └── schema.sql               # 建表脚本（含约束、索引与场地 / 分类种子数据）
-├── scripts/                     # 安装、启动、停止、清理与报告生成脚本
-│   ├── 首次安装并启动.bat
-│   ├── 启动校园活动系统.bat
-│   ├── 停止校园活动系统.bat
-│   ├── 交付前清理.bat
+├── scripts/                     # 一键安装 / 启动 / 停止（含交付前清理）与报告生成脚本
+│   ├── 启动校园活动系统.bat      # 首次运行即自动装依赖、写 .env、建库建表
+│   ├── 停止校园活动系统.bat      # 可选：清缓存 / 备份并删除 .env 与 .venv
 │   ├── er_diagram.py
 │   └── bench_queries.py
-├── tests/                       # pytest 自动化测试（15 个文件 / 101 个用例）
+├── tests/                       # pytest 自动化测试（17 个文件 / 133 个用例）
 │   ├── conftest.py
 │   ├── test_auth.py             …（详见「测试文件」一节）
 │   └── test_v2_regressions.py
@@ -114,16 +111,15 @@ CampusEventProject-fixed/
 | --- | --- | --- |
 | `app.py` | **唯一入口**，约 1600 行。包含：配置加载与启动校验（`APP_SECRET_KEY` 强度）、连接池 `get_conn()`（`ping(reconnect=True)`）、令牌签发与校验 `issue_token()` / `auth_user()`（含 `token_version` 比对）、装饰器 `require_user()` / `require_role()`、限流 `rate_limit()`（按 IP / 邮箱，`TRUSTED_PROXIES` 控制是否解析 `X-Forwarded-For`）、统一响应 `ok()` / `fail()` 与全局错误处理、活动字段校验 `_validated_event_fields()`（含场地冲突 `FOR UPDATE` 检查）、行锁工具 `_lock_event()`、以及全部 `/api/*` 路由，最后托管 `frontend/` 静态页 | 改接口、改校验、改并发逻辑 |
 | `init_db.py` | 建库建表；对**老库**执行幂等迁移 `migrate_existing_db()`：按 `INFORMATION_SCHEMA` 补列（`token_version` / `cancelled_at` / `cancelled_by` / `updated_at`）、把 `TIMESTAMP` 改成 `DATETIME`、补 / 重建外键与级联规则、补 6 条索引，并打印升级摘要。默认不动已存在的库，`--force` 才删表重建 | 拉代码后升级本机数据库、换电脑首次初始化 |
-| `make_admin.py` | 命令行把已有邮箱提升为 `role='admin'`（管理员不能自助注册） | 需要一个管理员账号时 |
-| `seed_demo.py` | 写入 1 管理员 + 2 组织者 + 3 学生、3 个不同状态的活动、若干报名 / 签到 / 评论，方便答辩演示 | 演示前想一键造数据 |
-| `setup_env.py` | 交互式询问数据库连接，生成 `.env`（含 `TEST_DB_NAME`、限流、连接池、时区、CORS、可信代理等全部键） | 首次安装（`首次安装并启动.bat` 会调用） |
+| `make_admin.py` | 把已有邮箱提升为 `role='admin'`；加 `--create <密码>` 可直接创建管理员，账号已存在时则重置管理员密码（管理员不能自助注册） | 需要一个管理员账号 / 忘了管理员密码时 |
+| `setup_env.py` | 交互式询问数据库连接，生成 `.env`（含 `TEST_DB_NAME`、限流、连接池、时区、CORS、可信代理等全部键） | 首次安装（`启动校园活动系统.bat` 会自动调用） |
 
 ### 前端文件 `frontend/`
 
 | 文件 | 作用 | 关键实现 |
 | --- | --- | --- |
-| `login.html` | 登录 / 注册页，可选「学生 / 组织者」角色，含密码强度前端校验 | 登录成功后把 `token` 与用户信息写入 `localStorage`，跳转 `index.html` |
-| `index.html` | 活动大厅：分页列表、分类筛选、活动详情弹窗、发布 / 编辑 / 删除 / 关闭报名、报名 / 取消、报名名单（含「显示已取消」）、签到 / 撤销签到、评论、管理员用户列表 | `parseDbTime()` 兼容 Safari 时间解析；`loadEvents('reset' / 'more' / 'refresh')` 三种刷新模式；所有核心按钮请求期间禁用防连点；用户输入统一 HTML 转义 |
+| `login.html` | 登录 / 注册页，可选「学生 / 组织者」角色，含密码强度前端校验 | 登录或注册成功后把 `token` 与用户信息写入 `localStorage`，跳转 `index.html` |
+| `index.html` | 活动大厅：分页列表、分类筛选、活动详情弹窗、发布 / 编辑 / 删除 / 关闭报名、报名 / 取消、报名名单（含「显示已取消」）、签到 / 撤销签到、评论、管理员用户列表、管理员场地管理 | `parseDbTime()` 兼容 Safari 时间解析；`loadEvents('reset' / 'more' / 'refresh')` 三种刷新模式；所有核心按钮请求期间禁用防连点；用户输入统一 HTML 转义 |
 | `profile.html` | 个人中心：「我的报名」分页与取消报名、「修改密码」面板 | 取消按钮在活动开始后自动隐藏；改密成功后写入返回的新令牌 |
 
 ### 数据库与脚本
@@ -131,10 +127,8 @@ CampusEventProject-fixed/
 | 文件 | 作用 |
 | --- | --- |
 | `database/schema.sql` | 全部 DDL：`CREATE DATABASE IF NOT EXISTS` + `USE` + 7 张业务表 + 约束（`UNIQUE` / `CHECK` / `enum` / 双向 `CASCADE`）+ 索引 + 4 个分类与 5 个场地的种子数据。可直接 `mysql -u root -p < database/schema.sql` |
-| `scripts/首次安装并启动.bat` | 一键安装：检测 Python → 建 `.venv` → 装依赖 → 引导生成 `.env` → 建库建表 → 启动服务并打开浏览器 |
-| `scripts/启动校园活动系统.bat` | 日常启动：服务未运行则后台启动，已运行则直接开浏览器（端口读 `.env` 的 `PORT`） |
-| `scripts/停止校园活动系统.bat` | 只停止本项目的进程，不会误杀其它占端口的程序 |
-| `scripts/交付前清理.bat` | 打包 / 提交前工具：交互确认后把 `.env` 备份到 `%USERPROFILE%\campus_events_env_backup.txt`，再删除 `.env` / `.venv` / `__pycache__` / `.pytest_cache` / `.coverage` / `htmlcov`，并打印自查清单 |
+| `scripts/启动校园活动系统.bat` | **一键安装 + 启动**：检测 Python → 建 `.venv` → 装依赖 → 引导生成 `.env` → 建库建表 → 后台启动服务并打开浏览器；装好之后日常启动也用它（服务未运行则启动，已运行则直接开浏览器，端口读 `.env` 的 `PORT`） |
+| `scripts/停止校园活动系统.bat` | 只停本项目进程，不会误杀其它占端口的程序；交互里还可选**交付前清理**：清 `__pycache__` / `.pytest_cache` / `.coverage` / `htmlcov`，或把 `.env` 备份到 `%USERPROFILE%\campus_events_env_backup.txt` 后连同 `.venv` 一起删除 |
 | `scripts/er_diagram.py` | 用 Pillow 直接绘制 ER 图（不依赖 Graphviz），输出 `docs/images/er-diagram.png`，改表结构后重跑即可保持图文一致 |
 | `scripts/bench_queries.py` | 在临时库造数（3000 活动 / 9000 报名 / 4000 评论 / 500 用户），对同一批 SQL 做「有索引 vs 去索引」的 `EXPLAIN` + 耗时对比，跑完自动删库；课程报告「性能实测」直接引用 |
 
@@ -142,25 +136,18 @@ CampusEventProject-fixed/
 
 `conftest.py` 是所有用例的公共基座：把连接切到 `TEST_DB_NAME`（默认 `campus_events_test`）、会话前后清空业务数据（保留 `venues` / `categories` 种子）、提供 `client` / `db_fetch` / `unique_event_window` 等夹具，并用「单调递增、互不重叠」的时间窗避免场地冲突导致的偶发失败。
 
-| 文件 | 用例数 | 覆盖内容 |
-| --- | --- | --- |
-| `conftest.py` | — | 测试库切换、数据清理、公共夹具与工具函数 |
-| `test_auth.py` | 3 | 注册 / 登录 / 令牌基础 |
-| `test_unauthorized.py` | 19 | 未登录访问各接口一律 401 |
-| `test_boundaries.py` | 8 | 超长姓名 / 邮箱 / 标题、过去时间、角色限制、非 API 路径 404 |
-| `test_register_event.py` | 1 | 并发报名防超卖（两线程抢 1 个名额） |
-| `test_cancel_registration.py` | 3 | 取消报名、重复取消、取消后重新报名 |
-| `test_check_in.py` | 5 | 签到时间窗、重复签到、越权签到 |
-| `test_close_event.py` | 6 | 关闭 / 重新开放报名及其状态约束 |
-| `test_event_manage.py` | 8 | 发布 / 编辑 / 删除保护 + 分页元信息 |
-| `test_event_detail.py` | 4 | 活动详情字段完整性、404、报名状态 |
-| `test_comments.py` | 5 | 评论发布 / 长度 / 空内容 / 404 / 未报名不得评论 |
-| `test_categories.py` | 6 | 分类列表、多分类发布、按分类筛选、非法分类 |
-| `test_my_registrations.py` | 2 | 我的报名与分页、仅本人可见 |
-| `test_rate_limit.py` | 3 | 登录限流、按账号隔离、成功后重置 |
-| `test_fixes.py` | 19 | 修复点回归：撤销签到、管理员代操作、时间窗、删除保护、取消留痕 |
-| `test_v2_regressions.py` | 9 | 本轮复核修复的回归：`started/ended`、`close/closed` 兼容、开始时间锁定、缩容下限、登出、改密、取消留痕、保留首次报名时间 |
-| **合计** | **101** | 可用 `pytest --collect-only -q` 核对 |
+17 个测试文件共 **133 个用例**（可用 `pytest --collect-only -q` 核对）：
+
+| 方向 | 测试文件（用例数） |
+| --- | --- |
+| 认证与权限 | `test_auth.py`(5)、`test_unauthorized.py`(24)、`test_user_roles.py`(11) |
+| 活动生命周期 | `test_event_manage.py`(8)、`test_event_detail.py`(4)、`test_close_event.py`(6)、`test_categories.py`(6) |
+| 报名与签到 | `test_register_event.py`(1)、`test_cancel_registration.py`(3)、`test_check_in.py`(5)、`test_my_registrations.py`(2) |
+| 场地管理 | `test_venues.py`(14) |
+| 评论 / 限流 / 边界 | `test_comments.py`(5)、`test_rate_limit.py`(3)、`test_boundaries.py`(8) |
+| 回归 | `test_fixes.py`(19)、`test_v2_regressions.py`(9) |
+
+逐个文件覆盖了什么、对应哪些接口，见 [`docs/测试报告.md`](docs/测试报告.md) 的「测试范围」与「用例分布」两节。
 
 ### 根目录配置与元文件
 
@@ -180,14 +167,12 @@ CampusEventProject-fixed/
 
 ### docs/ 交付文档
 
-| 文档 | 类型 | 内容概要 | 读者 |
-| --- | --- | --- | --- |
-| `README.md` | 交付 | 项目总览、文件清单、安装运行、环境变量、接口、业务规则、测试与交付清单 | 所有人，入口 |
-| `docs/README.md` | 交付 | **docs 目录索引**：4 份材料的清单与用途、3 条阅读路线（跑起来 / 写报告 / 答辩）、图表生成与更新约定 | 先看这个，再深入 |
-| `docs/数据库设计说明.md` | 交付 | 带目录。系统结构图与并发控制点、ER 图、Schema 设计决策与 1NF/2NF/3NF 论证、约束一览、索引清单 + 已知局限、6 条示例查询（大厅聚合 / 场地冲突 / 报名名单 / 取消留痕 / 出勤率 / 组织者统计）、含与不含索引的 `EXPLAIN` + 实测耗时 | 写报告、准备答辩 |
-| `docs/测试报告.md` | 交付 | 带目录。测试环境与运行命令、按模块的测试范围表、15 个文件 101 个用例的分布、5 个关键场景（并发防超卖 / 权限矩阵 / 时间窗 / 删除保护 / 场地冲突）、覆盖率（79%，870 语句 / 181 未覆盖）、结论 | 写报告、需要「测试证据」 |
-| `docs/images/er-diagram.png` | 交付 | 7 张表的全部列与类型、PK/FK/UQ/CK 标记、8 条关系连线（含 `cancelled_by`）、图例（枚举取值 / 级联规则 / 索引） | 报告插图、答辩 |
-| `docs/images/coverage.png` | 交付 | 早期覆盖率截图（78%），以测试报告正文的 79% 为准；可用 `pytest --cov=app --cov-report=html` 重生成 | 报告插图 |
+| 文档 | 讲什么 |
+| --- | --- |
+| [`docs/README.md`](docs/README.md) | docs 索引：材料清单、3 条阅读路线（跑起来 / 写报告 / 答辩）、图表更新约定 |
+| [`docs/数据库设计说明.md`](docs/数据库设计说明.md) | ER 图、Schema 设计决策与 1NF/2NF/3NF 论证、约束与索引清单、6 条示例 SQL、有/无索引的 `EXPLAIN` 与耗时对比 |
+| [`docs/测试报告.md`](docs/测试报告.md) | 运行命令、测试范围与用例分布（17 文件 / 133 用例）、5 个关键场景、覆盖率（87%）与结论 |
+| [`docs/images/`](docs/images) | `er-diagram.png`（由 `scripts/er_diagram.py` 生成）、`coverage.png`（`pytest --cov-report=html` 截图） |
 
 ### 作业要求/
 
@@ -197,34 +182,24 @@ CampusEventProject-fixed/
 
 ## 数据库设计
 
-共 7 张业务表，建表脚本见 [`database/schema.sql`](database/schema.sql)。
+共 7 张业务表（`users`、`venues`、`events`、`registrations`、`categories`、`event_categories`、`comments`），建表脚本见 [`database/schema.sql`](database/schema.sql)。
 
 ![ER 图](docs/images/er-diagram.png)
 
-> ER 图由 `scripts/er_diagram.py` 根据本表生成（`pip install pillow` 后运行该脚本），
-> 表结构改动后重跑即可保证图与 `schema.sql` 一致。
+> ER 图由 `scripts/er_diagram.py` 根据表结构生成（`pip install pillow` 后运行），改表后重跑即可保持一致。
 
-| 表 | 说明 | 关键约束 |
+几条最该记住的约束（完整列定义、范式论证、索引清单与示例 SQL 见 [`docs/数据库设计说明.md`](docs/数据库设计说明.md)）：
+
+| 位置 | 约束 | 为什么这么设 |
 | --- | --- | --- |
-| `users` | 用户（学生 / 组织者 / 管理员） | `email` 唯一；`role` 为 `enum`；`token_version` 用于令牌吊销 |
-| `venues` | 场地 | `available_status` 标记是否可用；`venue_name` 唯一 |
-| `events` | 活动 | `organizer_id` / `venue_id` 外键；`status` 为 `enum('open','closed')`；`CHECK (capacity > 0)`、`CHECK (end_time > start_time)`；`(venue_id, start_time, end_time)` 复合索引用于场地冲突检测 |
-| `registrations` | 报名记录 | `UNIQUE(student_id, event_id)` 防重复报名；`status` 为 `enum('registered','cancelled','checked_in')`；`cancelled_at` / `cancelled_by`（外键 `ON DELETE SET NULL`）记录取消人与时间；`idx_reg_event_status(event_id, status)` 服务名单与计数查询 |
-| `categories` | 活动分类 | — |
-| `event_categories` | 活动 ↔ 分类（N:M） | 复合主键 `(event_id, category_id)`，双向外键级联 |
-| `comments` | 活动评论 | `event_id` / `user_id` 外键，双向外键级联；`idx_event(event_id)` |
+| `registrations` | `UNIQUE(student_id, event_id)` | 一人一活动只有一条报名行，取消后重新报名是复用同一行（保留首次报名时间） |
+| `events` / `venues` | `CHECK (end_time > start_time)`、`CHECK (capacity > 0)` | 时间与容量在 DB 层再兜一道 |
+| 各枚举列 | `role` / `status` / `available_status` 用 `enum` / `CHECK` | 取值收敛，写错值直接报错 |
+| 外键 | 删活动 → 评论 / 分类 / 报名 `ON DELETE CASCADE`；`registrations.cancelled_by` 用 `SET NULL` | 保证不留孤儿行，同时保留「谁取消的」痕迹 |
 
-关系要点：
-
-- 一个组织者可发布多个活动（1:N），一个活动归属一个场地（N:1）。
-- 一个学生可报名多个活动，一个活动可被多个学生报名（N:M，通过 `registrations` 关联）。
-- 一个活动可挂多个分类（N:M，通过 `event_categories` 关联）。
-- 删除活动时：`comments` / `event_categories` / `registrations` 均由 DB 外键级联清理（`ON DELETE CASCADE`），应用层再显式兜底清理一次以兼容未升级的旧库（见 `delete_event()`）。
-- 所有时间列统一为 `DATETIME`，连接时固定会话时区 `DB_TIME_ZONE`（默认 `+08:00`），避免 Python/MySQL 时区不一致导致报名窗口错位。
-- 范式、索引策略、示例 SQL 与「有/无索引」的实测对比见 [`docs/数据库设计说明.md`](docs/数据库设计说明.md)。
-- 表名在 SQL 中统一使用**小写**（`users` / `events` / …），因此可在 `lower_case_table_names=0` 的 Linux / macOS MySQL 上直接运行。
-
-建表脚本同时写入基础种子数据：4 个活动分类、5 个场地。
+关系：组织者 1:N 活动，活动 N:1 场地，学生 N:M 活动（`registrations`），活动 N:M 分类（`event_categories`）。
+时间列统一 `DATETIME`，连接时固定会话时区 `DB_TIME_ZONE`（默认 `+08:00`），避免报名窗口错位。
+种子数据：4 个活动分类、5 个场地。
 
 ## 快速开始
 
@@ -254,11 +229,15 @@ CampusEventProject-fixed/
    python backend/init_db.py
    ```
 
-   初始化演示数据（方便第一次打开就有内容可看）：
+   初始化完成后库里只有场地与分类这两种基础数据，账号请直接在注册页自行注册（可选学生 / 组织者）；确实需要一个管理员时：
 
    ```bash
-   python backend/seed_demo.py
+   # 已有账号：直接提升；账号不存在：用 --create 直接建一个管理员
+   python backend/make_admin.py 你的邮箱@example.com
+   python backend/make_admin.py admin@campus.local --create Admin@2026
    ```
+
+   随包附带的 `管理员账号.txt` 里记录了初始管理员账号与密码（该文件已被 git 忽略，不进仓库）。
 
 3. 配置环境变量：复制模板并生成应用密钥
 
@@ -278,22 +257,20 @@ CampusEventProject-fixed/
 
 5. 浏览器访问 <http://127.0.0.1:5000/>（前端由 Flask 托管，无需额外开启 Live Server）。
 
-### 一键安装
+### 一键安装 / 启动
 
 > 适合组员快速体验，前提是已装好 Python 3.10+ 与 MySQL。
 
-1. 解压项目，**双击 `scripts/首次安装并启动.bat`**。
-2. 脚本自动完成：创建 `.venv` 虚拟环境 → 安装依赖 → 引导填写数据库连接（生成 `.env`）→ 建库建表 → 启动服务并打开浏览器。
-3. 后续使用双击 **`scripts/启动校园活动系统.bat`**（服务未运行则自动启动，已运行则直接打开浏览器）。
-4. 关闭服务双击 **`scripts/停止校园活动系统.bat`**。
-5. 打包 / 提交前双击 **`scripts/交付前清理.bat`**。
+1. 解压项目，**双击 `scripts/启动校园活动系统.bat`**。首次运行会自动完成：创建 `.venv` → 安装依赖 → 引导填写数据库连接（生成 `.env`）→ 建库建表 → 启动服务并打开浏览器。
+2. 之后启动同样双击它：服务未运行则自动启动，已运行则直接打开浏览器。
+3. 关闭服务双击 **`scripts/停止校园活动系统.bat`**；打包 / 提交前也用它，在它的清理选项里选择「只清缓存」或「连 `.env` / `.venv` 一起删」（`.env` 会先备份到用户目录）。
 
 说明：
 
 - 首次安装输入的 MySQL 密码仅写入本机 `.env`，不会上传、也不会进入 git。
 - `backend/init_db.py` 默认**不会**改动已存在的库；只有显式运行 `python backend/init_db.py --force` 才会删表重建。
 - 启动 / 停止脚本会从 `.env` 读取 `PORT`，改端口后无需修改脚本。
-- 换电脑 / 换同学重复「双击首次安装」即可，各环境配置相互独立。
+- 换电脑 / 换同学重复「双击启动脚本」即可，各环境配置相互独立。
 
 ## 环境变量
 
@@ -328,7 +305,7 @@ CampusEventProject-fixed/
 - 密码使用 bcrypt 加盐哈希存储，校验规则为「≥8 位且包含大小写字母与数字」，并限制 bcrypt 72 字节上限。
 - 登录按「IP + 邮箱」限流（默认 10 次 / 60 秒），注册按 IP 限流（默认 20 次 / 小时），评论按用户限流（默认 20 条 / 60 秒），超限返回 `429`。
 - 数据库凭据与应用密钥全部从 `.env` 读取，`.env` 已被 `.gitignore` 忽略；`APP_SECRET_KEY` 弱密钥直接拒绝启动。
-- **打包 / 提交前请同步删掉 `.env`（以及 `.venv`、`__pycache__`、`.pytest_cache`），否则真实数据库密码与签名密钥会一起交出**。可直接双击 `scripts/交付前清理.bat`。
+- **打包 / 提交前请同步删掉 `.env`（以及 `.venv`、`__pycache__`、`.pytest_cache`），否则真实数据库密码与签名密钥会一起交出**。可直接双击 `scripts/停止校园活动系统.bat` 并选择「连 `.env` / `.venv` 一起删」的清理项。
 - 跨域来源由 `CORS_ORIGINS` 控制（默认 `*`，生产环境建议收紧为具体地址）。
 - 前端对活动标题、描述、评论、用户名等用户输入统一做 HTML 转义，防范存储型 XSS。
 - 所有接口的异常统一转换为 `{"code", "message", "data"}`，不向前端回显内部堆栈或 SQL 细节。
@@ -345,7 +322,7 @@ CampusEventProject-fixed/
 
 | 方法 | 路径 | 说明 | 权限 |
 | --- | --- | --- | --- |
-| POST | `/api/register` | 注册（学生 / 组织者） | 公开 |
+| POST | `/api/register` | 注册（学生 / 组织者），成功后直接返回令牌（注册即登录） | 公开 |
 | POST | `/api/login` | 登录，返回用户信息与令牌 | 公开 |
 | POST | `/api/logout` | 退出登录（令牌立即失效） | 登录 |
 | PUT | `/api/change_password` | 修改密码（校验旧密码，返回新令牌） | 登录 |
@@ -364,11 +341,16 @@ CampusEventProject-fixed/
 | PUT | `/api/check_in/<registration_id>` | 学生签到 | 该活动组织者 / 管理员 |
 | PUT | `/api/undo_check_in/<registration_id>` | 撤销签到（误签纠正） | 该活动组织者 / 管理员 |
 | GET | `/api/venues` | 可用场地列表 | 登录 |
+| GET | `/api/admin/venues` | 全部场地（含已停用，带每个场地的活动数） | 管理员 |
+| POST | `/api/venues` | 新增场地 | 管理员 |
+| PUT | `/api/venues/<venue_id>` | 修改 / 停用场地 | 管理员 |
+| DELETE | `/api/venues/<venue_id>` | 删除场地（还有活动在用则 409） | 管理员 |
 | GET | `/api/categories` | 活动分类列表 | 登录 |
 | GET | `/api/comments/<event_id>` | 活动评论（分页） | 登录 |
 | POST | `/api/comments` | 发表评论（需报名过该活动 / 组织者 / 管理员） | 登录 |
 | DELETE | `/api/delete_comment/<comment_id>` | 删除评论 | 评论作者 / 活动组织者 / 管理员 |
 | GET | `/api/admin/users` | 全部用户列表（分页） | 管理员 |
+| PUT | `/api/admin/users/<user_id>/role` | 把组织者设为管理员 / 把管理员降回组织者 | 管理员 |
 
 ## 业务规则
 
@@ -380,18 +362,27 @@ CampusEventProject-fixed/
 - 编辑活动时，新名额不能小于当前有效报名人数；活动一旦开始，开始时间不再允许修改。
 - 删除活动前会校验：活动未开始、且没有签到记录，否则返回 409。
 - 评论 = 活动评价：只有报名过该活动的学生、该活动组织者或管理员可以评论（并有频次限制）。
+- 场地由管理员在活动大厅的「场地管理」里维护（新增 / 改名 / 改容量 / 停用 / 删除），字段要求：名称必填且唯一、容量大于 0；停用的场地不会出现在发布表单里，已发布的活动不受影响；还有活动在用的场地不能删除，只能停用；场地容量不能改到小于该场地已有活动的名额。
 - 取消报名会写入 `cancelled_at` / `cancelled_by`；重新报名保留首次报名时间，并清空取消留痕。
 - 退出登录会递增 `users.token_version`，所有已签发的旧令牌立即失效；修改密码同样会让旧令牌失效并返回新令牌。
 
 ## 管理员
 
-管理员不能自助注册（注册页仅可选学生 / 组织者），需将已有账号提升：
+管理员不能自助注册（注册页仅可选学生 / 组织者），需将已有账号提升，或直接用 `--create` 创建一个：
 
 ```bash
+# 提升已有账号
 python backend/make_admin.py someone@example.com
+
+# 账号不存在就创建 / 忘了密码就重置
+python backend/make_admin.py admin@campus.local --create Admin@2026
 ```
 
-管理员可删除任意活动 / 评论、代组织者签到与撤销签到、取消任意报名、发布活动，并在活动大厅的「用户管理」中查看全部用户。
+初始管理员账号记录在项目根目录的 `管理员账号.txt`（明文密码，已被 `.gitignore` 忽略，不会进仓库）。
+
+管理员可删除任意活动 / 评论、代组织者签到与撤销签到、取消任意报名、发布活动，并在活动大厅的「用户管理」中查看全部用户、「场地管理」中维护场地。
+
+有了一名管理员之后，「用户管理」里可以把组织者提为管理员，也可以把管理员降回组织者（被改的账号需重新登录才会看到新面板）；系统不允许修改自己的角色，所以永远至少保留一个管理员。学生不能直接提权，需要自己以组织者身份注册。
 
 ## 测试
 
@@ -402,39 +393,25 @@ python backend/make_admin.py someone@example.com
 3. 并发测试：对满员活动同时发起多个报名请求，验证不再超卖。
 4. 组织者签到 → 撤销签到 → 再次签到，验证状态流转正确。
 
-自动化测试（需先初始化数据库并配置好 `.env`）：
-
-```bash
-pip install -r requirements-dev.txt
-
-# 快速跑（不显示覆盖率）
-pytest tests/ -q
-
-# 看覆盖率
-pytest tests/ --cov=app --cov-report=term-missing
-
-# 生成 HTML 覆盖率报告
-pytest tests/ --cov=app --cov-report=html
-```
-
-首次跑测试前先初始化测试库（`conftest.py` 会自动切到 `TEST_DB_NAME`）：
+自动化测试（需先配置好 `.env`，并初始化测试库）：
 
 ```powershell
-$env:DB_NAME = 'campus_events_test'
-python backend/init_db.py
+pip install -r requirements-dev.txt
+$env:DB_NAME = 'campus_events_test'; python backend/init_db.py   # 首次跑一次
 ```
 
-测试库隔离：会话开始 / 结束时清空业务数据、时间窗单调分配，因此可反复运行、不会污染开发库，也不会因历史数据累积或场地冲突而偶发失败。
+```bash
+pytest tests/ -q                                    # 133 个用例，约 72s
+pytest tests/ --cov=app --cov-report=term-missing   # 附带行覆盖率
+```
 
-覆盖范围：认证与权限、输入边界、并发报名防超卖、取消 / 重新报名、签到与撤销签到、评论、分类、活动管理、分页、限流、404 处理、登出与改密。每个测试文件对应内容见「[测试文件](#测试文件-tests)」一节。
-
-> 当前 **101 个用例全部通过**（连续 3 次，约 56s/次），行覆盖率约 **79%**（实测 870 条语句 / 181 条未覆盖）。
-> 详细报告与覆盖率截图见 [`docs/测试报告.md`](docs/测试报告.md)。
+> 当前 **133 个用例全部通过**（连续 3 次，约 72s/次），行覆盖率 **87%**（实测 884 条语句 / 118 条未覆盖）。
+> 测试库与开发库隔离、会话前后清空业务数据，可反复运行。用例分布、5 个关键场景与覆盖率截图见 [`docs/测试报告.md`](docs/测试报告.md)。
 
 ## 已知限制与后续计划
 
 1. 活动列表排序含表达式 `(e.end_time < NOW())`，走不了 `idx_start_time`；实测 3000 行时 1.17ms，完全够用，彻底解法（物化「是否已结束」列或拆两条查询）与取舍记录在 `docs/数据库设计说明.md §4`。
-2. 管理员能力偏窄：只能看用户列表，不能改角色 / 禁用账号；场地、分类只有查询接口，没有后台主数据增删改。
+2. 管理端能力仍偏窄：用户侧只有列表与调整角色（`PUT /api/admin/users/<id>/role`），没有禁用 / 删除账号；场地已支持增删改（`/api/venues`），分类仍只有查询接口，没有后台增删改。
 3. 超卖与场地冲突由应用层事务 + 行锁保证，数据库层没有触发器 / 存储过程兜底；若课程要求展示 DB 级约束，可加 `BEFORE INSERT` 触发器。
 4. 令牌放在 `localStorage`（有 XSS 风险）、无 refresh token；本轮只做到「登出 / 改密即失效」，未改造成 HttpOnly Cookie。
 5. 前端无自动化 E2E 测试（只有语法检查 + 人工冒烟），建议补 Playwright 冒烟脚本。
@@ -444,8 +421,8 @@ python backend/init_db.py
 ## 交付前 checklist
 
 - [ ] 1. `python backend/init_db.py`（开发库）与测试库各执行一次，确认打印「库结构已是最新」或升级摘要。
-- [ ] 2. `pytest tests -q` → `101 passed`。
-- [ ] 3. 双击 `scripts/交付前清理.bat`（删除 `.env` / `.venv` / 缓存，`.env` 自动备份到用户目录）。
+- [ ] 2. `pytest tests -q` → `133 passed`。
+- [ ] 3. 双击 `scripts/停止校园活动系统.bat`，选「连 `.env` / `.venv` 一起删」（`.env` 会先备份到用户目录）。
 - [ ] 4. 确认压缩包里没有 `.env` / `.venv` / `__pycache__` / `.pytest_cache` / `htmlcov`，也没有过程记录（问题清单、修复记录）。
 - [ ] 5. 在一台干净环境按「快速开始」再走一遍（可选但强烈建议）。
 - [ ] 6. 若改了表结构，重跑 `python scripts/er_diagram.py` 并更新 `docs/` 与 README 中的表说明。
