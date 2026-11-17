@@ -147,6 +147,12 @@ def db_cursor(*, commit=False, action=None, error_message=None,
                 # 同一资源被并发重复创建，语义上是冲突（409）而不是参数错误
                 raise AppError(conflict_message or '数据已存在，请勿重复提交',
                                code=409, http_status=409) from err
+            if err.errno == 1644:
+                # 触发器里 SIGNAL SQLSTATE '45000' 抛出的业务约束
+                # （场地时间段重叠、报名状态与时间戳不一致……）
+                message = getattr(err, 'msg', None) or '数据不满足数据库层约束'
+                app.logger.warning('%s：数据库约束拦截 %s', action or '数据库操作', err)
+                raise AppError(message, code=409, http_status=409) from err
             if err.errno in (1213, 1205):
                 # 1213 死锁 / 1205 锁等待超时：并发下的可重试冲突，不该报成 500
                 app.logger.warning('%s：并发冲突 errno=%s %s',
@@ -284,6 +290,19 @@ def _int_id(value, label='ID'):
     if value <= 0:
         raise AppError(f"{label}不合法")
     return value
+
+
+def _call_procedure(cur, name, params=()):
+    """调用存储过程并读完它返回的所有结果集。
+
+    不读完的话，同一连接上后续的 SQL 会报 "Unread result found"。
+    """
+    placeholders = ', '.join(['%s'] * len(params))
+    cur.execute(f'CALL {name}({placeholders})', params)
+    rows = cur.fetchall()
+    while cur.nextset():
+        pass
+    return rows
 
 
 def _pagination(default_size):
@@ -750,31 +769,28 @@ def get_events():
     cat_where = ''
     cat_params = []
     if category_id:
-        cat_where = ' AND e.event_id IN (SELECT event_id FROM event_categories WHERE category_id = %s)'
+        cat_where = ' AND v.event_id IN (SELECT event_id FROM event_categories WHERE category_id = %s)'
         cat_params = [category_id]
 
+    # 活动总览走 v_event_overview 视图：报名数/签到数/余量/是否开始结束都由视图算好，
+    # 不用在每条查询里再写一遍相关子查询。is_registered 跟当前用户有关，留在应用层。
     sql = f"""
-        SELECT
-            e.event_id, e.title, e.description, e.organizer_id, e.venue_id,
-            e.start_time, e.end_time, e.capacity, e.status,
-            v.venue_name, v.location AS venue_location,
-            (NOW() > e.start_time) AS started,
-            (e.end_time < NOW()) AS ended,
-            (SELECT COUNT(*) FROM registrations r
-              WHERE r.event_id = e.event_id AND r.status <> 'cancelled') AS registered_count,
-            (SELECT COUNT(*) FROM registrations r
-              WHERE r.event_id = e.event_id AND r.student_id = %s
-                AND r.status <> 'cancelled') AS is_registered
-        FROM events e
-        LEFT JOIN venues v ON e.venue_id = v.venue_id
+        SELECT v.event_id, v.title, v.description, v.organizer_id, v.venue_id,
+               v.start_time, v.end_time, v.capacity, v.status,
+               v.venue_name, v.venue_location,
+               v.started, v.ended, v.registered_count, v.remaining,
+               EXISTS(SELECT 1 FROM registrations r
+                       WHERE r.event_id = v.event_id AND r.student_id = %s
+                         AND r.status <> 'cancelled') AS is_registered
+        FROM v_event_overview v
         WHERE 1=1{cat_where}
-        ORDER BY (e.end_time < NOW()) ASC,
-                 e.start_time ASC, e.event_id ASC
+        ORDER BY v.ended ASC,
+                 v.start_time ASC, v.event_id ASC
         LIMIT %s OFFSET %s
     """
     with db_cursor(action='查询活动列表') as cur:
         cur.execute(
-            f"SELECT COUNT(*) AS total FROM events e WHERE 1=1{cat_where}",
+            f"SELECT COUNT(*) AS total FROM v_event_overview v WHERE 1=1{cat_where}",
             tuple(cat_params),
         )
         total = cur.fetchone()['total']
@@ -817,23 +833,15 @@ def get_events():
 def get_event_detail(event_id):
     user = require_user()
     with db_cursor(action='查询活动详情') as cur:
+        # 视图已经算好报名数/签到数/余量，只多一个跟当前用户相关的 is_registered
         cur.execute(
             """
-            SELECT e.event_id, e.title, e.description, e.organizer_id, e.venue_id,
-                   e.start_time, e.end_time, e.capacity, e.status, e.updated_at,
-                   v.venue_name, v.location AS venue_location,
-                   u.name AS organizer_name,
-                   (SELECT COUNT(*) FROM registrations r
-                     WHERE r.event_id = e.event_id AND r.status <> 'cancelled') AS registered_count,
-                   (SELECT COUNT(*) FROM registrations r
-                     WHERE r.event_id = e.event_id AND r.student_id = %s
-                       AND r.status <> 'cancelled') AS is_registered,
-                   (NOW() > e.start_time) AS started,
-                   (e.end_time IS NOT NULL AND NOW() > e.end_time) AS ended
-              FROM events e
-              LEFT JOIN venues v ON e.venue_id = v.venue_id
-              LEFT JOIN users u ON e.organizer_id = u.user_id
-             WHERE e.event_id = %s
+            SELECT v.*,
+                   EXISTS(SELECT 1 FROM registrations r
+                           WHERE r.event_id = v.event_id AND r.student_id = %s
+                             AND r.status <> 'cancelled') AS is_registered
+              FROM v_event_overview v
+             WHERE v.event_id = %s
             """,
             (user['user_id'], event_id),
         )
@@ -853,6 +861,51 @@ def get_event_detail(event_id):
     fmt_row(event, 'start_time', 'end_time', 'updated_at')
     event['remaining'] = max(int(event['capacity'] or 0) - int(event['registered_count'] or 0), 0)
     return ok(data=event)
+
+
+# 活动统计：聚合交给数据库（存储过程 + 视图），接口只负责组装与鉴权
+@app.route('/api/events/<int:event_id>/stats', methods=['GET'])
+def get_event_stats(event_id):
+    user = require_user()
+
+    with db_cursor(action='查询活动统计') as cur:
+        _require_event_owner(cur, event_id, user, "无权查看该活动的统计")
+
+        rows = _call_procedure(cur, 'sp_event_attendance', (event_id,))
+        if not rows:
+            raise AppError("活动不存在", code=404, http_status=404)
+        summary = rows[0]
+
+        cur.execute(
+            "SELECT status, COUNT(*) AS cnt FROM registrations "
+            " WHERE event_id = %s GROUP BY status ORDER BY status",
+            (event_id,),
+        )
+        by_status = {row['status']: row['cnt'] for row in cur.fetchall()}
+
+        # 按天统计报名趋势（DATE() 分桶 + GROUP BY）
+        cur.execute(
+            "SELECT DATE(registered_at) AS day, COUNT(*) AS cnt "
+            "  FROM registrations "
+            " WHERE event_id = %s AND status <> 'cancelled' "
+            " GROUP BY DATE(registered_at) ORDER BY day",
+            (event_id,),
+        )
+        daily = cur.fetchall()
+
+    return ok(data={
+        'event_id': summary['event_id'],
+        'title': summary['title'],
+        'capacity': int(summary['capacity'] or 0),
+        'active_regs': int(summary['active_regs'] or 0),
+        'checked_in': int(summary['checked_in'] or 0),
+        'cancelled': int(summary['cancelled'] or 0),
+        'attendance_pct': float(summary['attendance_pct'] or 0),
+        'fill_pct': float(summary['fill_pct'] or 0),
+        'by_status': by_status,
+        'daily_registrations': [{'day': str(row['day']), 'count': row['cnt']}
+                                 for row in daily],
+    })
 
 
 # 报名：事务 + 行锁，防超卖
@@ -1056,20 +1109,21 @@ def delete_event(event_id):
     with db_cursor(commit=True, action='删除活动', error_message='删除失败，请稍后重试') as cur:
         _require_event_owner(cur, event_id, user, "无权删除他人发布的活动")
         # 加锁顺序和报名接口一致（先 events 后 registrations），避免死锁
-        _lock_event(cur, event_id)
+        current = _lock_event(cur, event_id)
+        if not current:
+            raise AppError("活动不存在", code=404, http_status=404)
 
-        # 有签到或已开始的活动，普通组织者不能删
+        # 签到数也要锁定读：普通 SELECT 会读到本事务最早那条快照，
+        # 刚提交的签到可能看不到，于是把有考勤记录的活动删掉。
         cur.execute(
-            "SELECT (NOW() > start_time) AS started, "
-            "       (SELECT COUNT(*) FROM registrations "
-            "         WHERE event_id = %s AND status = 'checked_in') AS checked "
-            "  FROM events WHERE event_id = %s",
-            (event_id, event_id),
+            "SELECT COUNT(*) AS cnt FROM registrations "
+            " WHERE event_id = %s AND status = 'checked_in' FOR UPDATE",
+            (event_id,),
         )
-        state = cur.fetchone()
-        if state and state['checked']:
+        checked = cur.fetchone()['cnt']
+        if checked:
             raise AppError("该活动已有签到记录，不能删除", code=409, http_status=409)
-        if state and state['started'] and not is_admin(user):
+        if current['started'] and not is_admin(user):
             raise AppError("活动已开始，不能删除", code=409, http_status=409)
         
         # 老库可能没配级联，先手动清关联数据
@@ -1624,6 +1678,82 @@ def change_password():
         )
         new_version = int(row['token_version'] or 0) + 1
     return ok("密码已修改，请使用新密码重新登录", token=issue_token(user['user_id'], new_version))
+
+
+@app.route('/api/admin/stats', methods=['GET'])
+def admin_stats():
+    """平台概览：全部是数据库端聚合（GROUP BY / HAVING / 视图）。"""
+    user = require_user()
+    if not is_admin(user):
+        raise AppError("只有管理员可以查看平台统计", code=403, http_status=403)
+
+    with db_cursor(action='查询平台统计') as cur:
+        cur.execute("SELECT role, COUNT(*) AS cnt FROM users GROUP BY role ORDER BY role")
+        users_by_role = cur.fetchall()
+
+        cur.execute("SELECT status, COUNT(*) AS cnt FROM events GROUP BY status ORDER BY status")
+        events_by_status = cur.fetchall()
+
+        cur.execute("SELECT status, COUNT(*) AS cnt FROM registrations GROUP BY status ORDER BY status")
+        registrations_by_status = cur.fetchall()
+
+        # 分类分布：HAVING 过滤掉没有任何活动的分类
+        cur.execute("""
+            SELECT c.category_id, c.category_name,
+                   COUNT(DISTINCT ec.event_id) AS event_count,
+                   COUNT(DISTINCT r.registration_id) AS registration_count
+              FROM categories c
+              LEFT JOIN event_categories ec ON ec.category_id = c.category_id
+              LEFT JOIN registrations r ON r.event_id = ec.event_id
+                                       AND r.status <> 'cancelled'
+             GROUP BY c.category_id, c.category_name
+            HAVING COUNT(DISTINCT ec.event_id) > 0
+             ORDER BY event_count DESC, c.category_name
+        """)
+        by_category = cur.fetchall()
+
+        # 场地利用率：每个场地的活动数、报名总数、平均上座率
+        cur.execute("""
+            SELECT v.venue_id, v.venue_name, v.capacity, v.available_status,
+                   COUNT(DISTINCT o.event_id) AS event_count,
+                   COALESCE(SUM(o.registered_count), 0) AS registrations,
+                   ROUND(COALESCE(SUM(o.registered_count), 0)
+                         / NULLIF(SUM(o.capacity), 0) * 100, 1) AS fill_pct
+              FROM venues v
+              LEFT JOIN v_event_overview o ON o.venue_id = v.venue_id
+             GROUP BY v.venue_id, v.venue_name, v.capacity, v.available_status
+             ORDER BY event_count DESC, v.venue_name
+        """)
+        venue_usage = cur.fetchall()
+
+        # 报名最满的 5 个活动（直接用视图算出来的报名数）
+        cur.execute("""
+            SELECT event_id, title, venue_name, start_time,
+                   registered_count, capacity,
+                   ROUND(registered_count / NULLIF(capacity, 0) * 100, 1) AS fill_pct
+              FROM v_event_overview
+             WHERE capacity > 0
+             ORDER BY fill_pct DESC, registered_count DESC
+             LIMIT 5
+        """)
+        top_events = cur.fetchall()
+
+    for row in venue_usage:
+        row['registrations'] = int(row['registrations'] or 0)
+        row['fill_pct'] = float(row['fill_pct'] or 0)
+        row['available_status'] = int(row['available_status'] or 0)
+    for row in top_events:
+        fmt_row(row, 'start_time')
+        row['fill_pct'] = float(row['fill_pct'] or 0)
+
+    return ok(data={
+        'users_by_role': users_by_role,
+        'events_by_status': events_by_status,
+        'registrations_by_status': registrations_by_status,
+        'by_category': by_category,
+        'venue_usage': venue_usage,
+        'top_events': top_events,
+    })
 
 
 @app.route('/api/admin/users', methods=['GET'])

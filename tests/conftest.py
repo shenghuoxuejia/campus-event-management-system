@@ -40,13 +40,38 @@ def unique_window():
             (base + timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S'))
 
 
+def _move_to_dedicated_venue(db, db_fetch, event_id):
+    """把活动挪到一个专属新建场地。
+
+    active_scene / ended_scene 这类夹具会把活动时间改成「相对 NOW()」，
+    而库里其他用例的活动可能用同一个场地 —— 数据库触发器会（正确地）
+    把它们当成时间段重叠而拒绝。给这类夹具一个专属场地就没冲突了。
+    """
+    name = f'测试场地_{uuid.uuid4().hex[:10]}'
+    db("INSERT INTO venues (venue_name, location, capacity, available_status) "
+       "VALUES (%s, '测试区', 500, 1)", (name,))
+    venue_id = db_fetch('SELECT venue_id FROM venues WHERE venue_name = %s', (name,))[0]['venue_id']
+    db('UPDATE events SET venue_id = %s WHERE event_id = %s', (venue_id, event_id))
+
+
 def _wipe_test_data():
     tables = ('comments', 'event_categories', 'registrations', 'events', 'users')
     with app_module.db_cursor(commit=True) as cur:
+        # 先确认连的真是测试库：名字比较可能被大小写/连接串绕过，这里看实际库名
+        cur.execute('SELECT DATABASE() AS db')
+        active = (cur.fetchone() or {}).get('db') or ''
+        if active.lower() != TEST_DB_NAME.lower():
+            raise RuntimeError(
+                f'拒绝清理数据：当前连接的是 {active!r}，不是测试库 {TEST_DB_NAME!r}'
+            )
         cur.execute('SET FOREIGN_KEY_CHECKS = 0')
         try:
             for table in tables:
                 cur.execute(f'DELETE FROM `{table}`')
+            # 测试自己造的场地也清掉，种子场地（不叫这个名字）保留
+            cur.execute("DELETE FROM venues WHERE venue_name LIKE '测试场地\\_%'")
+            # 种子场地可能被某个用例停用过，恢复到可用状态，不影响下个用例
+            cur.execute('UPDATE venues SET available_status = 1')
         finally:
             cur.execute('SET FOREIGN_KEY_CHECKS = 1')
 
@@ -67,9 +92,30 @@ def _ensure_test_db():
     _wipe_test_data()
 
 
+@pytest.fixture(autouse=True)
+def _clean_before_each_test():
+    """每个用例开始前清一次业务数据。
+
+    只在 session 开始/结束清的话，跑一半 Ctrl-C 或 pytest -x 中断后，
+    下一次会话会从脏数据开始，用例互相影响（比如场地时间段全被占完）。
+    """
+    _wipe_test_data()
+    with app_module._rate_lock:
+        app_module._rate_buckets.clear()   # 限流计数也别跨用例残留
+    yield
+
+
 @pytest.fixture()
 def unique_event_window():
     return unique_window
+
+
+@pytest.fixture()
+def move_to_own_venue(db, db_fetch):
+    """给活动换一个专属场地（需要把时间改成「相对 NOW()」的用例用）。"""
+    def _move(event_id):
+        _move_to_dedicated_venue(db, db_fetch, event_id)
+    return _move
 
 
 @pytest.fixture()
@@ -160,13 +206,14 @@ def registration(client, make_user, auth, event):
 
 
 @pytest.fixture()
-def active_scene(client, make_user, auth, event, db):
+def active_scene(client, make_user, auth, event, db, db_fetch):
     # 接口不允许建过去的活动，所以先正常报名，再把时间直接改到进行中
     stu_user, stu_token = make_user('student')
     resp = client.post('/api/register_event', headers=auth(stu_token),
                        json={'event_id': event['event_id']})
     assert resp.status_code == 200, resp.get_json()
 
+    _move_to_dedicated_venue(db, db_fetch, event['event_id'])
     db("UPDATE events SET start_time = NOW() - INTERVAL 1 HOUR, "
        "end_time = NOW() + INTERVAL 1 HOUR WHERE event_id = %s",
        (event['event_id'],))
@@ -175,12 +222,13 @@ def active_scene(client, make_user, auth, event, db):
 
 
 @pytest.fixture()
-def ended_scene(client, make_user, auth, event, db):
+def ended_scene(client, make_user, auth, event, db, db_fetch):
     stu_user, stu_token = make_user('student')
     resp = client.post('/api/register_event', headers=auth(stu_token),
                        json={'event_id': event['event_id']})
     assert resp.status_code == 200, resp.get_json()
 
+    _move_to_dedicated_venue(db, db_fetch, event['event_id'])
     db("UPDATE events SET start_time = NOW() - INTERVAL 3 HOUR, "
        "end_time = NOW() - INTERVAL 1 HOUR WHERE event_id = %s",
        (event['event_id'],))

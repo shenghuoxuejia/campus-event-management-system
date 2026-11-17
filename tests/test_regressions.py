@@ -212,8 +212,9 @@ def test_re_register_clears_cancel_fields(client, auth, event, registration):
     assert row['check_in_time'] is None
 
 
-def test_event_list_exposes_started_and_ended(client, auth, event, db):
+def test_event_list_exposes_started_and_ended(client, auth, event, db, move_to_own_venue):
     # 列表接口拿不到 started/ended 的话，前端会把结束的活动都显示成「报名中」
+    move_to_own_venue(event['event_id'])
     db("UPDATE events SET start_time = NOW() - INTERVAL 3 HOUR, "
        "end_time = NOW() - INTERVAL 1 HOUR WHERE event_id = %s",
        (event['event_id'],))
@@ -438,3 +439,69 @@ def test_unknown_api_path_returns_json_404(client):
     resp = client.get('/api/no-such-endpoint')
     assert resp.status_code == 404
     assert resp.get_json()['code'] == 404
+
+
+def test_register_rate_limited(client, app, monkeypatch):
+    """注册限流：同一个 IP 连续注册超过阈值要返回 429（TESTING 会跳过限流，这里临时关掉）。"""
+    monkeypatch.setattr(app_module, 'REGISTER_RATE_LIMIT', (2, 60))
+    app.config['TESTING'] = False
+    _clear_buckets()
+    try:
+        for i in range(2):
+            resp = client.post('/api/register', json={
+                'name': '限流测试', 'password': 'Passw0rd123', 'role': 'student',
+                'email': f'ratelimit_{i}_{uuid.uuid4().hex[:8]}@test.com',
+            })
+            assert resp.status_code == 200, resp.get_json()
+
+        resp = client.post('/api/register', json={
+            'name': '限流测试', 'password': 'Passw0rd123', 'role': 'student',
+            'email': f'ratelimit_over_{uuid.uuid4().hex[:8]}@test.com',
+        })
+        assert resp.status_code == 429
+        assert resp.get_json()['code'] == 429
+        assert '频繁' in resp.get_json()['message']
+    finally:
+        app.config['TESTING'] = True
+        _clear_buckets()
+
+
+def test_comment_rate_limited(client, app, auth, event, registration, monkeypatch):
+    monkeypatch.setattr(app_module, 'COMMENT_RATE_LIMIT', (2, 60))
+    app.config['TESTING'] = False
+    _clear_buckets()
+    try:
+        for i in range(2):
+            resp = client.post('/api/comments', headers=auth(registration['stu_token']),
+                               json={'event_id': event['event_id'], 'content': f'评论{i}'})
+            assert resp.status_code == 200, resp.get_json()
+
+        resp = client.post('/api/comments', headers=auth(registration['stu_token']),
+                           json={'event_id': event['event_id'], 'content': '超限'})
+        assert resp.status_code == 429
+        assert resp.get_json()['code'] == 429
+    finally:
+        app.config['TESTING'] = True
+        _clear_buckets()
+
+
+def test_change_password_rate_limited(client, app, auth, make_user, monkeypatch):
+    """拿到令牌后反复猜旧密码也要被限流。"""
+    monkeypatch.setattr(app_module, 'LOGIN_RATE_LIMIT', (2, 60))
+    app.config['TESTING'] = False
+    _clear_buckets()
+    try:
+        _, token = make_user('student')
+        for _ in range(2):
+            resp = client.put('/api/change_password', headers=auth(token), json={
+                'old_password': 'WrongPass1', 'new_password': 'Passw0rd456',
+            })
+            assert resp.status_code == 400, resp.get_json()
+
+        resp = client.put('/api/change_password', headers=auth(token), json={
+            'old_password': 'WrongPass1', 'new_password': 'Passw0rd456',
+        })
+        assert resp.status_code == 429, resp.get_json()
+    finally:
+        app.config['TESTING'] = True
+        _clear_buckets()

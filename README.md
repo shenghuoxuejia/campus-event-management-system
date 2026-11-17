@@ -14,6 +14,8 @@ Flask + MySQL 写的校园活动管理平台，两种角色：学生报名参加
 - 组织者可以发布 / 编辑 / 关闭活动、签到 / 撤销签到、把学生移出活动
 - 活动评论区：只有报名过的学生、组织者本人或管理员能评论
 - 管理员可以管用户角色、维护场地、删任意活动和评论
+- 活动统计（出入率、报名趋势）给组织者和管理员；平台概览（分类分布、场地利用率、最热活动）给管理员
+- 一致性不只靠应用层：库里有 1 个视图 `v_event_overview`、4 个触发器、1 个存储过程 `sp_event_attendance` 兜底（详见 `docs/数据库设计说明.md`）
 - 所有接口统一返回 `{"code", "message", "data"}`
 
 ## 目录结构
@@ -21,7 +23,7 @@ Flask + MySQL 写的校园活动管理平台，两种角色：学生报名参加
 ```text
 backend/     Flask 应用（app.py 主程序）和建库 / 管理员脚本
 frontend/    三个静态页：login.html / index.html / profile.html
-database/    schema.sql，建表 + 约束 + 索引 + 场地和分类的种子数据
+database/    schema.sql，建表 + 约束 + 索引 + 视图 + 触发器 + 存储过程 + 种子数据
 scripts/     一键启动 / 停止的 bat，以及 ER 图、查询基准两个报告脚本
 tests/       pytest 用例
 docs/        数据库设计说明、测试报告和配图
@@ -119,6 +121,9 @@ python backend/make_admin.py admin@campus.local --create Admin@2026   # 直接�
 | DELETE | `/api/delete_comment/<id>` | 删评论 | 作者 / 该活动组织者 / 管理员 |
 | GET | `/api/admin/users` | 用户列表 | 管理员 |
 | PUT | `/api/admin/users/<id>/role` | 组织者和管理员互转 | 管理员 |
+| GET | `/api/events/<id>/stats` | 活动统计（出入率、状态分布、报名趋势） | 该活动组织者 / 管理员 |
+| GET | `/api/admin/stats` | 平台统计（分类分布、场地利用率、最热活动） | 管理员 |
+| PUT | `/api/admin/users/<id>/role` | 组织者和管理员互转 | 管理员 |
 
 分页接口额外返回 `total` / `page` / `page_size` / `pages`，`data` 还是数组。
 
@@ -144,17 +149,17 @@ $env:DB_NAME = 'campus_events_test'; python backend/init_db.py
 pytest tests -q
 ```
 
-129 个用例，跑一遍大概 80 秒，覆盖认证、权限、活动生命周期、并发报名、签到、评论、分类、场地、分页、限流这些场景。测试库和开发库是分开的，每次跑前后会清空业务数据，可以反复跑。
+150 个用例，跑一遍大概 95 秒，覆盖认证、权限、活动生命周期、并发报名、签到、评论、分类、场地、分页、限流、统计接口和数据库端对象这些场景。测试库和开发库是分开的，每个用例前都会清一次业务数据（并校验当前连接的确实是测试库），中断了也不会抱脏数据。
 
 并发那条用例（`test_no_oversell`）用 `threading.Barrier` 把两个线程卡在同一起跑线，跑 8 轮，每轮断言“状态码正好 `[200, 400]` + 失败原因是名额已满 + 库里只有 1 条有效报名”。它是能真抳 bug 的：把 `_lock_event` 里的 `FOR UPDATE` 临时去掉，第 0 轮就会报 `[200, 200]`。
 
-要看覆盖率就 `pytest tests --cov=app --cov-report=term-missing`，当前 88%。
+要看覆盖率就 `pytest tests --cov=app --cov-report=term-missing`，当前 89%。
 
 ## 还没做的
 
 - 活动列表的排序里有 `(end_time < NOW())` 这种表达式，用不上 `idx_start_time` 索引。3000 行数据实测 1.14ms，先这样了。
 - 用户管理只有列表和改角色，没有禁用 / 删除账号。分类也还没有后台增删改的接口。
-- 防超卖靠应用层的事务和行锁，数据库那边没写触发器兜底。
+- 防超卖靠应用层的事务和行锁，数据库端触发器只做单语句兜底（应用层被绕过时拦得住），不负责并发串行化——触发器里不能对正在写入的同一张表做锁定读（MySQL 1442）。
 - 令牌放 localStorage，有 XSS 风险，也还没做 refresh token。这轮只做到登出 / 改密即失效。
 - 前端没有自动化测试，只有人工点。
 

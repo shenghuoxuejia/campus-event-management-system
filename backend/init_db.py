@@ -185,15 +185,24 @@ def drop_all_tables(conn, dbname):
 
 
 def load_statements(sql_text):
-    """把 schema.sql 拆成单条语句（跳过注释与空行）。"""
+    """把 schema.sql 拆成单条语句（跳过注释与空行）。
+
+    支持 `DELIMITER $$` 写法：触发器 / 存储过程体内有分号，不能简单地按行尾 `;` 切。
+    DELIMITER 本身是 mysql 客户端的指令，不能发给服务器，所以在这里消化掉。
+    """
     statements, buf = [], []
+    delimiter = ';'
     for raw in sql_text.splitlines():
         line = raw.strip()
         if not line or line.startswith('--'):
             continue
+        if line.upper().startswith('DELIMITER '):
+            delimiter = line.split(None, 1)[1].strip()
+            continue
         buf.append(raw)
-        if line.endswith(';'):
-            stmt = '\n'.join(buf).strip().rstrip(';').strip()
+        if line.endswith(delimiter):
+            stmt = '\n'.join(buf).strip()
+            stmt = stmt[:-len(delimiter)].strip()
             if stmt:
                 statements.append(stmt)
             buf = []
@@ -202,6 +211,72 @@ def load_statements(sql_text):
         if stmt:
             statements.append(stmt)
     return statements
+
+
+# 数据库端对象（视图 / 触发器 / 存储过程）的语句前缀，老库升级时也要补上
+OBJECT_PREFIXES = ('CREATE OR REPLACE VIEW', 'CREATE TRIGGER', 'DROP TRIGGER',
+                   'CREATE PROCEDURE', 'DROP PROCEDURE')
+
+
+def apply_schema_objects(conn, statements, dbname):
+    """把 schema.sql 里的视图 / 触发器 / 存储过程应用到库上（幂等）。返回执行条数。
+
+    视图和触发器是库内对象，必须先在连接上选库（调用方传进来的连接可能还没 USE）。
+    """
+    objects = [s for s in statements if s.upper().startswith(OBJECT_PREFIXES)]
+    if not objects:
+        return 0
+    with closing(conn.cursor()) as cur:
+        cur.execute(f'USE `{dbname}`')
+        for stmt in objects:
+            cur.execute(stmt)
+    conn.commit()
+    return len(objects)
+
+
+EXPECTED_TABLES = ('users', 'venues', 'events', 'registrations',
+                   'categories', 'event_categories', 'comments')
+
+# (INFORMATION_SCHEMA 表, 库名列, 对象名列, 对象名)
+EXPECTED_OBJECTS = (
+    ('VIEWS', 'TABLE_SCHEMA', 'TABLE_NAME', 'v_event_overview'),
+    ('TRIGGERS', 'TRIGGER_SCHEMA', 'TRIGGER_NAME', 'trg_events_check_venue_bi'),
+    ('TRIGGERS', 'TRIGGER_SCHEMA', 'TRIGGER_NAME', 'trg_events_check_venue_bu'),
+    ('TRIGGERS', 'TRIGGER_SCHEMA', 'TRIGGER_NAME', 'trg_registrations_status_bi'),
+    ('TRIGGERS', 'TRIGGER_SCHEMA', 'TRIGGER_NAME', 'trg_registrations_status_bu'),
+    ('ROUTINES', 'ROUTINE_SCHEMA', 'ROUTINE_NAME', 'sp_event_attendance'),
+)
+
+
+def check_server_version(conn, minimum=(8, 0, 16)):
+    """检查 MySQL 版本。低于 8.0.16 时 CHECK 约束会被静默忽略。返回错误文案或 None。"""
+    with closing(conn.cursor()) as cur:
+        cur.execute('SELECT VERSION()')
+        raw = cur.fetchone()[0]
+    match = re.match(r'(\d+)\.(\d+)\.(\d+)', str(raw))
+    if not match:
+        return None
+    version = tuple(int(x) for x in match.groups())
+    if version < minimum:
+        need = '.'.join(map(str, minimum))
+        return (f'MySQL {raw} 版本太低，需要 {need}+ '
+                '（CHECK 约束需 8.0.16+，种子语句的行别名写法需 8.0.19+）')
+    return None
+
+
+def verify_objects(conn, dbname):
+    """确认视图 / 触发器 / 存储过程真的建出来了。返回缺失清单。"""
+    missing = []
+    with closing(conn.cursor()) as cur:
+        for schema_table, db_column, name_column, name in EXPECTED_OBJECTS:
+            cur.execute(
+                f'SELECT COUNT(*) FROM INFORMATION_SCHEMA.{schema_table} '
+                f'WHERE {db_column} = %s AND {name_column} = %s',
+                (dbname, name),
+            )
+            if cur.fetchone()[0] == 0:
+                missing.append(name)
+    return missing
 
 
 def main():
@@ -232,6 +307,16 @@ def main():
         print('       请确认 MySQL 服务已启动，且 .env 里的主机/端口/用户名/密码正确。')
         return 1
 
+    version_problem = check_server_version(conn)
+    if version_problem:
+        print(f'[错误] {version_problem}')
+        conn.close()
+        return 1
+
+    statements = load_statements(SCHEMA_PATH.read_text(encoding='utf-8'))
+    skipped = ('CREATE DATABASE', 'USE ')
+    table_statements = [s for s in statements if not s.upper().startswith(skipped)]
+
     try:
         with closing(conn.cursor()) as cur:
             cur.execute(
@@ -242,16 +327,18 @@ def main():
 
             has_tables = False
             if db_exists:
+                placeholders = ','.join(['%s'] * len(EXPECTED_TABLES))
                 cur.execute(
-                    'SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES '
-                    'WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s',
-                    (dbname, 'users'),
+                    'SELECT COUNT(DISTINCT TABLE_NAME) FROM INFORMATION_SCHEMA.TABLES '
+                    f'WHERE TABLE_SCHEMA = %s AND TABLE_NAME IN ({placeholders})',
+                    (dbname,) + EXPECTED_TABLES,
                 )
-                has_tables = cur.fetchone()[0] > 0
+                # 7 张表全在才算建成，只有部分表说明上次建到一半失败了
+                has_tables = cur.fetchone()[0] == len(EXPECTED_TABLES)
 
             if has_tables and not force:
                 print(f'数据库 `{dbname}` 已存在且已建表，跳过建表。')
-                # 老库升级：幂等补齐后续版本新增的列 / 索引 / 外键
+                # 老库升级：幂等补齐后续版本新增的列 / 索引 / 外键，再补上数据库端对象
                 changes = migrate_existing_db(conn, dbname)
                 if any(changes.values()):
                     print('已升级老库：'
@@ -259,8 +346,12 @@ def main():
                           f"时间类型修正 {changes['datetime']} 个，"
                           f"外键 {changes['foreign_keys']} 个，"
                           f"索引 {changes['indexes']} 个。")
-                else:
-                    print('库结构已是最新，无需升级。')
+                objects = apply_schema_objects(conn, statements, dbname)
+                print(f'已同步数据库端对象（视图/触发器/存储过程）{objects} 条语句。')
+                missing = verify_objects(conn, dbname)
+                if missing:
+                    print('[错误] 以下对象没有建成：' + ', '.join(missing))
+                    return 1
                 print('（如需重建，运行：python backend/init_db.py --force）')
                 return 0
 
@@ -278,17 +369,18 @@ def main():
     finally:
         conn.close()
 
-    statements = load_statements(SCHEMA_PATH.read_text(encoding='utf-8'))
-    skipped = ('CREATE DATABASE', 'USE ')
-    statements = [s for s in statements if not s.upper().startswith(skipped)]
-
     conn = mysql.connector.connect(database=dbname, **base_cfg)
     try:
         with closing(conn.cursor()) as cur:
-            for stmt in statements:
+            for stmt in table_statements:
                 cur.execute(stmt)
             conn.commit()
         migrate_existing_db(conn, dbname)
+        missing = verify_objects(conn, dbname)
+        if missing:
+            print('[错误] 建表完成，但以下对象没建成：' + ', '.join(missing))
+            print('       请检查是否使用只读账号，或删掉 schema.sql 里的对应对象。')
+            return 1
     except mysql.connector.Error as err:
         conn.rollback()
         print(f'[错误] 执行建表语句失败：{err}')
@@ -296,7 +388,8 @@ def main():
     finally:
         conn.close()
 
-    print(f'数据库 `{dbname}` 初始化完成，共执行 {len(statements)} 条语句。')
+    print(f'数据库 `{dbname}` 初始化完成：建表与初始化语句 {len(table_statements)} 条，'
+          '视图 1 个、触发器 4 个、存储过程 1 个。')
     return 0
 
 

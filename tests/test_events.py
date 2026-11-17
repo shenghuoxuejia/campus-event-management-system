@@ -458,3 +458,44 @@ def test_student_cannot_create_event(client, auth, make_user):
     })
     assert resp.status_code == 403
     assert resp.get_json()['code'] == 403
+
+
+def test_delete_event_removes_children(client, auth, make_user, unique_event_window, db_fetch):
+    """删除活动的成功路径：关联的评论 / 分类 / 报名都要一起清掉，不能留孤儿数据。"""
+    _, org_token = make_user('organizer')
+    _, stu_token = make_user('student')
+    venue = _venues(client, org_token)[0]
+    category = client.get('/api/categories',
+                          headers=auth(org_token)).get_json()['data'][0]
+    start, end = unique_event_window()
+
+    created = client.post('/api/create_event', headers=auth(org_token), json={
+        'title': '待删活动', 'description': '删除级联测试',
+        'venue_id': venue['venue_id'], 'start_time': start, 'end_time': end,
+        'capacity': 5, 'category_ids': [category['category_id']],
+    })
+    assert created.status_code == 200, created.get_json()
+    eid = created.get_json()['data']['event_id']
+
+    assert client.post('/api/register_event', headers=auth(stu_token),
+                       json={'event_id': eid}).status_code == 200
+    assert client.post('/api/comments', headers=auth(stu_token),
+                       json={'event_id': eid, 'content': '占位评论'}).status_code == 200
+
+    def child_counts():
+        return (
+            db_fetch('SELECT COUNT(*) AS c FROM comments WHERE event_id = %s', (eid,))[0]['c'],
+            db_fetch('SELECT COUNT(*) AS c FROM event_categories WHERE event_id = %s', (eid,))[0]['c'],
+            db_fetch('SELECT COUNT(*) AS c FROM registrations WHERE event_id = %s', (eid,))[0]['c'],
+        )
+
+    assert child_counts() == (1, 1, 1)
+
+    deleted = client.delete(f'/api/delete_event/{eid}', headers=auth(org_token))
+    assert deleted.status_code == 200, deleted.get_json()
+
+    assert child_counts() == (0, 0, 0)
+    assert client.get(f'/api/events/{eid}', headers=auth(org_token)).status_code == 404
+    # 再删一次就是 404，不能返回 200
+    assert client.delete(f'/api/delete_event/{eid}',
+                         headers=auth(org_token)).status_code == 404
