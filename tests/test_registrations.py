@@ -297,3 +297,124 @@ def test_comments_pagination_meta(client, auth, event, registration):
     assert len(page2['data']) >= 1
     assert {c['comment_id'] for c in page1['data']}.isdisjoint(
         {c['comment_id'] for c in page2['data']})
+
+
+
+# ---------- 报名被拒绝的几种情况（这些分支之前零覆盖） ----------
+
+def test_cannot_register_closed_event(client, auth, event, make_user):
+    client.put(f"/api/close_event/{event['event_id']}",
+               headers=auth(event['org_token']), json={'action': 'close'})
+    _, token = make_user('student')
+    resp = client.post('/api/register_event', headers=auth(token),
+                       json={'event_id': event['event_id']})
+    assert resp.status_code == 400
+    assert '已关闭' in resp.get_json()['message']
+
+
+def test_cannot_register_started_event(client, auth, active_scene, make_user):
+    _, token = make_user('student')
+    resp = client.post('/api/register_event', headers=auth(token),
+                       json={'event_id': active_scene['event_id']})
+    assert resp.status_code == 400
+    assert '已经开始' in resp.get_json()['message']
+
+
+def test_cannot_register_ended_event(client, auth, ended_scene, make_user):
+    _, token = make_user('student')
+    resp = client.post('/api/register_event', headers=auth(token),
+                       json={'event_id': ended_scene['event_id']})
+    assert resp.status_code == 400
+    assert '已结束' in resp.get_json()['message']
+
+
+def test_duplicate_registration_rejected(client, auth, event, registration):
+    resp = client.post('/api/register_event', headers=auth(registration['stu_token']),
+                       json={'event_id': event['event_id']})
+    assert resp.status_code == 400
+    assert '重复报名' in resp.get_json()['message']
+
+
+def test_cannot_register_missing_event(client, auth, make_user):
+    _, token = make_user('student')
+    resp = client.post('/api/register_event', headers=auth(token),
+                       json={'event_id': 99999999})
+    assert resp.status_code == 404
+
+
+# ---------- 删除评论的权限边界（整个接口之前零覆盖） ----------
+
+def _post_comment(client, auth, token, event_id, content='评论内容'):
+    resp = client.post('/api/comments', headers=auth(token),
+                       json={'event_id': event_id, 'content': content})
+    assert resp.status_code == 200, resp.get_json()
+    return resp
+
+
+def _comment_ids(db_fetch, event_id):
+    return [r['comment_id'] for r in
+            db_fetch("SELECT comment_id FROM comments WHERE event_id = %s "
+                     "ORDER BY comment_id", (event_id,))]
+
+
+def test_comment_author_can_delete_own(client, auth, event, registration, db_fetch):
+    _post_comment(client, auth, registration['stu_token'], event['event_id'])
+    cid = _comment_ids(db_fetch, event['event_id'])[0]
+
+    resp = client.delete(f'/api/delete_comment/{cid}',
+                         headers=auth(registration['stu_token']))
+    assert resp.status_code == 200, resp.get_json()
+    assert _comment_ids(db_fetch, event['event_id']) == []
+
+
+def test_organizer_can_delete_student_comment(client, auth, event, registration, db_fetch):
+    _post_comment(client, auth, registration['stu_token'], event['event_id'])
+    cid = _comment_ids(db_fetch, event['event_id'])[0]
+
+    resp = client.delete(f'/api/delete_comment/{cid}', headers=auth(event['org_token']))
+    assert resp.status_code == 200, resp.get_json()
+    assert _comment_ids(db_fetch, event['event_id']) == []
+
+
+def test_stranger_cannot_delete_comment(client, auth, event, registration,
+                                       make_user, db_fetch):
+    _post_comment(client, auth, registration['stu_token'], event['event_id'])
+    cid = _comment_ids(db_fetch, event['event_id'])[0]
+
+    _, other_token = make_user('student')
+    resp = client.delete(f'/api/delete_comment/{cid}', headers=auth(other_token))
+    assert resp.status_code == 403
+    assert _comment_ids(db_fetch, event['event_id']) == [cid]   # 没被删掉
+
+
+def test_admin_can_delete_any_comment(client, auth, event, registration,
+                                      make_user, db, db_fetch):
+    _post_comment(client, auth, registration['stu_token'], event['event_id'])
+    cid = _comment_ids(db_fetch, event['event_id'])[0]
+
+    admin_user, admin_token = make_user('student')
+    db("UPDATE users SET role = 'admin' WHERE user_id = %s", (admin_user['user_id'],))
+
+    resp = client.delete(f'/api/delete_comment/{cid}', headers=auth(admin_token))
+    assert resp.status_code == 200, resp.get_json()
+    assert _comment_ids(db_fetch, event['event_id']) == []
+
+
+def test_delete_missing_comment_404(client, auth, make_user):
+    _, token = make_user('student')
+    resp = client.delete('/api/delete_comment/99999999', headers=auth(token))
+    assert resp.status_code == 404
+
+
+# ---------- 越权读他人报名 ----------
+
+def test_cannot_read_other_user_registrations(client, auth, event, registration, make_user):
+    other_user, _ = make_user('student')
+    resp = client.get(f"/api/user_registrations/{other_user['user_id']}",
+                      headers=auth(registration['stu_token']))
+    assert resp.status_code == 403
+
+    own = client.get(f"/api/user_registrations/{registration['student']['user_id']}",
+                     headers=auth(registration['stu_token']))
+    assert own.status_code == 200
+    assert len(own.get_json()['data']) == 1

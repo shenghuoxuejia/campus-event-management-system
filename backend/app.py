@@ -389,14 +389,23 @@ def _validate_datetime(value, field_label):
     raise AppError(f"{field_label}格式不正确，请使用 YYYY-MM-DD HH:MM")
 
 
-def _get_venue(cur, venue_id):
-    """读可用场地并加行锁，不然两个并发发布可能同时通过时间冲突检查。"""
+def _get_venue(cur, venue_id, *, allow_inactive=False):
+    """读场地并加行锁，不然两个并发发布可能同时通过时间冲突检查。
+
+    allow_inactive=True 用于编辑已有活动：场地被管理员停用后，放在该场地的活动
+    仍然要允许继续编辑（否则停用场地 = 把这些活动全部锁死）。
+    """
     cur.execute(
-        "SELECT venue_id, capacity FROM venues "
-        "WHERE venue_id = %s AND available_status = 1 FOR UPDATE",
+        "SELECT venue_id, capacity, available_status FROM venues "
+        "WHERE venue_id = %s FOR UPDATE",
         (venue_id,),
     )
-    return cur.fetchone()
+    venue = cur.fetchone()
+    if venue is None:
+        return None
+    if not allow_inactive and not int(venue.get('available_status') or 0):
+        return None
+    return venue
 
 
 def _fmt_dt(value):
@@ -438,10 +447,15 @@ def _require_event_owner(cur, event_id, user, deny_message="无权操作该活�
 
 
 def _lock_event(cur, event_id):
-    """锁定活动行并读取容量/状态/时间信息。"""
+    """锁定活动行，并读出后续判定需要的全部字段。
+
+    REPEATABLE READ 下，普通 SELECT 读到的是事务最早那条一致性快照；锁定读
+    （FOR UPDATE）读的才是最新已提交版本。所以编辑等写操作用到的字段一律从
+    这里拿，不要再另发一条普通 SELECT，否则会拿锁拿到新行、读却读回旧值。
+    """
     cur.execute(
         """
-        SELECT capacity, status,
+        SELECT event_id, organizer_id, venue_id, start_time, end_time, capacity, status,
                (NOW() > start_time) AS started,
                (end_time IS NOT NULL AND NOW() > end_time) AS ended
         FROM events WHERE event_id = %s FOR UPDATE
@@ -535,7 +549,8 @@ def _validated_event_fields(cur, data, *, require_future=True, exclude_event_id=
     if capacity <= 0:
         raise AppError("名额必须大于 0")
 
-    venue = _get_venue(cur, venue_id)
+    venue = _get_venue(cur, venue_id,
+                       allow_inactive=bool(current and str(venue_id) == str(current.get('venue_id'))))
     if not venue:
         raise AppError("所选场地不存在或已停用")
     if venue['capacity'] is not None and capacity > venue['capacity']:
@@ -928,14 +943,11 @@ def update_event(event_id):
     with db_cursor(commit=True, action='编辑活动', error_message='保存失败，请检查填写的时间格式是否正确') as cur:
         _require_event_owner(cur, event_id, user, "无权编辑他人发布的活动")
 
-        # 先锁活动行，后面的名额校验才读得到最新数据
-        _lock_event(cur, event_id)
-        cur.execute(
-            "SELECT venue_id, start_time, end_time, "
-            "(NOW() > start_time) AS started FROM events WHERE event_id = %s",
-            (event_id,),
-        )
-        current = cur.fetchone()
+        # 先锁活动行：锁定读读的是最新已提交版本，后面的 started / 名额 / 时间
+        # 判定全部用这一行，不再另发普通 SELECT（它拿到的会是本事务的旧快照）
+        current = _lock_event(cur, event_id)
+        if not current:
+            raise AppError("活动不存在", code=404, http_status=404)
         started = bool(current['started'])
 
         # 开始后不能改开始时间，否则等于把报名/签到重新放开
